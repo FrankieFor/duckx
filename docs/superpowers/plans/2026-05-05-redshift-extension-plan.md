@@ -71,8 +71,15 @@ arrow = "53"
 Write `spikes/arrow_compat/src/main.rs`:
 
 ```rust
-//! Verifies connectorx ArrowDestination produces the `arrow` crate's RecordBatch.
-//! This is a build-time check: if it compiles, the types are compatible.
+//! Verifies two things at compile time:
+//!   1. connectorx ArrowDestination produces the `arrow` crate's
+//!      `RecordBatch` (not arrow2).
+//!   2. The destination's exposed type is `Vec<RecordBatch>` vs. a
+//!      streaming iterator. This determines whether the production
+//!      design's "streaming, no full materialization" claim holds; if
+//!      `arrow()` returns `Vec`, connectorx materializes the full result
+//!      set in destination memory before we can walk it, and the spec's
+//!      Memory Model section MUST be updated to reflect that.
 
 use arrow::record_batch::RecordBatch as ArrowRb;
 use connectorx::destinations::arrow::ArrowDestination;
@@ -82,7 +89,7 @@ fn main() {
     let mut dest = ArrowDestination::new();
     // Force the compiler to confirm the destination's batch type IS `arrow::RecordBatch`.
     let _proof: fn(ArrowDestination) -> Vec<ArrowRb> = |d| d.arrow().expect("arrow batches");
-    println!("compat OK");
+    println!("compat OK; arrow() returns Vec<RecordBatch>");
 }
 ```
 
@@ -92,7 +99,7 @@ Run: `cd spikes/arrow_compat && cargo check`
 
 Expected: success. If it fails with a type-mismatch on `_proof`, the spike has detected the `arrow2`/`arrow` split — STOP and report to the orchestrator before proceeding.
 
-- [ ] **Step 4: Document the result**
+- [ ] **Step 4: Document the result + streaming verdict**
 
 Write `spikes/arrow_compat/README.md`:
 
@@ -100,19 +107,39 @@ Write `spikes/arrow_compat/README.md`:
 # arrow_compat spike
 
 Verifies that `connectorx::destinations::arrow::ArrowDestination` produces
-`arrow`-crate `RecordBatch`es directly (not `arrow2`).
+`arrow`-crate `RecordBatch`es directly (not `arrow2`), AND records whether
+`arrow()` returns a fully-materialized `Vec` or a streaming iterator.
 
 ## Result (filled in at run time)
 
 - connectorx version: <fill in from Cargo.lock>
 - arrow version: <fill in from Cargo.lock>
 - compat: OK / NEEDS REWRAP / BLOCKED
+- destination type: `Vec<RecordBatch>` (materialized) / streaming iterator
+
+## Implications
+
+If destination type is `Vec<RecordBatch>` (likely on 0.4): the spec's
+Memory Model section's claim "no batch is ever fully materialized" is
+WRONG and must be updated to:
+
+> connectorx materializes the full result set in `ArrowDestination`
+> during the dispatcher's `run()`. After dispatch, our iterator walks
+> the resulting `Vec<RecordBatch>` and emits batches into DuckDB chunk
+> at a time. Peak memory is therefore the full result set size, not
+> `partition_num × batch`. For very large extracts, prefer `UNLOAD` +
+> `read_parquet` (already documented as a non-goal).
+
+If a streaming destination is available, prefer it.
 
 ## Decision
 
 If compat is OK: proceed to main implementation, depend on `arrow` crate only.
 If REWRAP: add a small `arrow2 -> arrow` shim in `pipeline.rs` (~5% perf cost).
 If BLOCKED: stop the workflow and re-brainstorm.
+
+If destination is `Vec`: update `docs/superpowers/specs/2026-05-05-redshift-extension-design.md`
+Memory Model section before continuing to Task 2.
 ```
 
 - [ ] **Step 5: Commit**
@@ -284,6 +311,29 @@ Run: `cd spikes/hello_extension && cargo test --release -- --test-threads=1`
 Expected: PASS — proves end-to-end build → load → call → result.
 
 If FAIL on `LOAD`: extension framework is misconfigured — stop and report. If FAIL on the assertion: VTab implementation is wrong — fix and rerun.
+
+- [ ] **Step 7b: Verify `set_arrow` is callable on a flat vector**
+
+Add a second test to `spikes/hello_extension/src/lib.rs` that registers a second VTab `arrow_passthrough()` returning a single Int32 column populated from an `arrow::array::Int32Array` via `vector(0).set_arrow(...)`. If that method does not exist on the pinned `duckdb-rs` version, this is a Task 10 blocker — record the alternative path (element-wise dispatch) in the spike README and update Task 10's `copy_batch_into_chunk` step.
+
+Sketch:
+
+```rust
+use arrow::array::Int32Array;
+use std::sync::Arc;
+
+fn try_set_arrow_path(chunk: &mut duckdb::core::DataChunkHandle) -> Result<(), Box<dyn std::error::Error>> {
+    let arr = Int32Array::from(vec![1, 2, 3]);
+    chunk.vector(0).set_arrow(&arr as &dyn arrow::array::Array)?;
+    chunk.set_len(3);
+    Ok(())
+}
+```
+
+Update the spike README with one of:
+
+- **set_arrow available** → Task 10's `copy_batch_into_chunk` body works as written.
+- **set_arrow NOT available** → Task 10 must implement element-wise dispatch on `LogicalTypeId`. Document this and bump the Task 10 estimate.
 
 - [ ] **Step 8: Commit**
 
@@ -1649,7 +1699,7 @@ pub fn validate(args: &PartitionArgs) -> Result<PartitionSpec, DuckxError> {
             }
             if !(2..=64).contains(&num) {
                 return Err(DuckxError::PartitionBoundsInvalid {
-                    reason: "partition_num must be between 1 and 64",
+                    reason: "partition_num must be between 2 and 64 (use 1 or omit for unpartitioned)",
                 });
             }
             crate::config::validate_identifier(col)?;

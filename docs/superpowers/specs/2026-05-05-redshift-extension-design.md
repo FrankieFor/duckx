@@ -64,7 +64,7 @@ Arguments:
 | `partition_min` | `BIGINT` | no | auto | If omitted, discovered via `SELECT MIN(col)` on the user query. |
 | `partition_max` | `BIGINT` | no | auto | If omitted, discovered via `SELECT MAX(col)`. |
 
-Unknown named args are rejected at bind time. `partition_num` without `partition_on` errors. `partition_min > partition_max` errors. `partition_num = 1` is treated as the unpartitioned case (single connection); `partition_num` must be in `[1, 64]`. `partition_on` must match `^[A-Za-z_][A-Za-z0-9_]*$` (validated at bind time) and is double-quoted when interpolated into partition SQL to support mixed-case identifiers safely. `partition_on` must reference an integer-typed column; non-numeric columns (e.g. `DATE`, `VARCHAR`) error at the `MIN/MAX` discovery step.
+Unknown named args are rejected at bind time. `partition_num` without `partition_on` errors. `partition_min > partition_max` errors. `partition_num = 1` is treated as the unpartitioned case (single connection); `partition_num` must be in `[1, 64]`. `partition_on` must match `^[A-Za-z_][A-Za-z0-9_]*$` (validated at bind time) and is double-quoted when interpolated into partition SQL to support mixed-case identifiers safely. `partition_on` must reference an integer-typed column; non-numeric columns (e.g. `DATE`, `VARCHAR`) error at the `MIN/MAX` discovery step. The column named in `partition_on` must appear in the user query's `SELECT` list (or be reachable through `SELECT *`); the partition wrapper references the column on the wrapped subquery, and Redshift will return a "column does not exist" error if the user's projection drops it.
 
 ### Credentials
 
@@ -149,7 +149,11 @@ This is also the seam for v2 features: `ATTACH` becomes a new module alongside `
 
 ### Memory model
 
-No batch is ever fully materialized in extension memory. At most `partition_num × 1` Arrow batches are in flight (channel bound = N). Default Arrow batch size is connectorx's default (~64 K rows). Worst-case peak in-flight rows: `64 × 64 K ≈ 4 M rows`. For typical row sizes of ~256 B, that's ~1 GB of in-flight data — documented as the practical upper bound and the reason `partition_num` is capped at 64.
+> Verified by Task 1 spike. The text below assumes connectorx 0.4's `ArrowDestination` materializes the full result set as `Vec<RecordBatch>` during `Dispatcher::run()`; if the spike finds a streaming destination is available, prefer it and update this section.
+
+connectorx materializes the full result set into the `ArrowDestination` during the dispatcher's run. After dispatch, our iterator walks the resulting `Vec<RecordBatch>` and emits one batch into DuckDB per `func` call. **Peak memory is therefore the full result set size in Arrow form, not `partition_num × batch`.**
+
+This makes the "tens of millions of rows" non-goal a hard limit, not a soft one. For typical row sizes of ~256 B, 10 M rows ≈ 2.5 GB of resident memory during the scan. README documents `UNLOAD … TO 's3://'` + `read_parquet` as the path for larger extracts (already a non-goal). `partition_num` is capped at 64 to bound concurrent Redshift connections, not memory.
 
 ### Concurrency and connection model
 
