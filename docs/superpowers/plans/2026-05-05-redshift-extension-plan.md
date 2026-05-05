@@ -89,7 +89,27 @@ fn main() {
     let mut dest = ArrowDestination::new();
     // Force the compiler to confirm the destination's batch type IS `arrow::RecordBatch`.
     let _proof: fn(ArrowDestination) -> Vec<ArrowRb> = |d| d.arrow().expect("arrow batches");
-    println!("compat OK; arrow() returns Vec<RecordBatch>");
+
+    // Also compile-test the production Dispatcher snippet from Task 9.
+    // This catches API drift that would otherwise blow up at Task 9.
+    // We don't actually run it — we just need the types to resolve.
+    fn _dispatcher_typecheck() {
+        use connectorx::sources::postgres::{rewrite_tls_args, BinaryProtocol, PostgresSource};
+        use connectorx::sql::CXQuery;
+        use connectorx::transports::PostgresArrowTransport;
+
+        let url = url::Url::parse("postgresql://u:p@h:5432/d?sslmode=disable").unwrap();
+        let (cfg_url, _tls): (_, _) = rewrite_tls_args(&url).unwrap();
+        let queries: Vec<CXQuery<String>> = vec![CXQuery::naked("SELECT 1")];
+        let source = PostgresSource::<BinaryProtocol, _>::new(cfg_url, queries.len()).unwrap();
+        let mut destination = ArrowDestination::new();
+        let dispatcher = connectorx::prelude::Dispatcher::<
+            _, _, PostgresArrowTransport<BinaryProtocol, _>,
+        >::new(source, &mut destination, &queries, None);
+        let _ = dispatcher; // don't run; just typecheck
+    }
+
+    println!("compat OK; arrow() returns Vec<RecordBatch>; Dispatcher API resolved");
 }
 ```
 
@@ -312,28 +332,17 @@ Expected: PASS — proves end-to-end build → load → call → result.
 
 If FAIL on `LOAD`: extension framework is misconfigured — stop and report. If FAIL on the assertion: VTab implementation is wrong — fix and rerun.
 
-- [ ] **Step 7b: Verify `set_arrow` is callable on a flat vector**
+- [ ] **Step 7b: Verify `set_arrow` works across the type matrix**
 
-Add a second test to `spikes/hello_extension/src/lib.rs` that registers a second VTab `arrow_passthrough()` returning a single Int32 column populated from an `arrow::array::Int32Array` via `vector(0).set_arrow(...)`. If that method does not exist on the pinned `duckdb-rs` version, this is a Task 10 blocker — record the alternative path (element-wise dispatch) in the spike README and update Task 10's `copy_batch_into_chunk` step.
+Add a second test to `spikes/hello_extension` that registers an `arrow_passthrough(type_kind)` VTab and exercises `vector(i).set_arrow(...)` for **every type from Task 7's mapping**: at minimum `Int32`, `Int64`, `Float64`, `Utf8`, `LargeUtf8`, `Binary`, `Date32`, `Time64(Microsecond)`, `Timestamp(Microsecond, None)`, `Timestamp(Microsecond, Some("UTC"))`, `Decimal128(18, 4)`. The VTab should accept a `type_kind: VARCHAR` parameter and dispatch to the corresponding Arrow array constructor.
 
-Sketch:
+Why this matters: if `set_arrow` works for `Int32` but breaks on `Decimal128` or `Timestamp(tz)`, Task 10's `copy_batch_into_chunk` is fundamentally broken and the fallback (element-wise dispatch on `LogicalTypeId`) is much larger work — that has to be discovered in the spike, not at Task 10 integration-test time.
 
-```rust
-use arrow::array::Int32Array;
-use std::sync::Arc;
+Update the spike README with one of three outcomes:
 
-fn try_set_arrow_path(chunk: &mut duckdb::core::DataChunkHandle) -> Result<(), Box<dyn std::error::Error>> {
-    let arr = Int32Array::from(vec![1, 2, 3]);
-    chunk.vector(0).set_arrow(&arr as &dyn arrow::array::Array)?;
-    chunk.set_len(3);
-    Ok(())
-}
-```
-
-Update the spike README with one of:
-
-- **set_arrow available** → Task 10's `copy_batch_into_chunk` body works as written.
-- **set_arrow NOT available** → Task 10 must implement element-wise dispatch on `LogicalTypeId`. Document this and bump the Task 10 estimate.
+- **set_arrow works for all tested types** → Task 10's `copy_batch_into_chunk` body works as written.
+- **set_arrow works for some types, breaks on others** → Document the type-by-type breakdown. Task 10 must implement per-type fallback for the broken types — record the list and bump the Task 10 estimate by ~50 LOC per broken type.
+- **set_arrow not available at all** → Task 10 must implement full element-wise dispatch on `LogicalTypeId`. Document this and bump the Task 10 estimate by ~200 LOC.
 
 - [ ] **Step 8: Commit**
 
@@ -491,8 +500,8 @@ default = []
 redshift-integration = []
 
 [dependencies]
-duckdb = { version = "1.4", features = ["vtab", "extension-loadable"] }
-duckdb-loadable-macros = "0.1"
+duckdb = { version = "=1.4.0", features = ["vtab", "extension-loadable"] }
+duckdb-loadable-macros = "=0.1.6"
 connectorx = { version = "0.4", features = ["src_postgres", "dst_arrow"] }
 arrow = "53"
 postgres = "0.19"
@@ -1278,17 +1287,25 @@ Run: `cargo test --test secret_lookup -- --test-threads=1`
 
 Expected: FAIL — module does not exist.
 
-- [ ] **Step 4: Implement `secret.rs`**
+- [ ] **Step 4: Implement `secret.rs` by copying directly from the spike**
 
-Skeleton — fill in `register_redshift_secret_type` and `lookup_secret` bodies using the exact API path recorded in `spikes/secrets_api/README.md`. Do not invent API symbols — copy from the spike.
+The two function bodies (`register_redshift_secret_type`, `read_secret_fields`) come **verbatim from Task 2.5's spike** — Task 2.5 step 5 produces a `spikes/secrets_api/src/secrets_api.rs` file that this task `cp`s into `src/secret.rs` (with the type name change `REDSHIFT_TEST` → `REDSHIFT`). Do not commit any state with `todo!()` in `src/` — the CI grep gate (Task 14) blocks it, and there's no reason to leave one behind because the spike has already produced working code.
+
+Procedure:
+
+1. Open `spikes/secrets_api/src/main.rs` (and the extracted `secrets_api.rs` from Task 2.5's deliverable).
+2. Copy the two function bodies into `src/secret.rs` using the skeleton below; replace the type-name string `"REDSHIFT_TEST"` with `"REDSHIFT"`.
+3. Verify `grep -rn 'todo!()' src/` returns nothing before committing.
+
+Skeleton:
 
 ```rust
 //! DuckDB Secrets Manager integration for `TYPE REDSHIFT`.
 //!
 //! Implementation strategy is defined in `spikes/secrets_api/README.md`
 //! (Task 2.5). Field-read uses whichever C-API or Rust-API path that
-//! spike validated. Owned `String`s are returned so callers cannot hold
-//! a pointer past secret rotation.
+//! spike validated. Function bodies below are copied verbatim from the
+//! spike with the type-name string changed.
 
 use crate::config::{Config, SslMode};
 use crate::error::DuckxError;
@@ -1298,12 +1315,15 @@ use secrecy::SecretString;
 pub const SECRET_FIELDS: &[&str] = &["host", "port", "user", "password", "database", "sslmode"];
 
 pub fn register_redshift_secret_type(conn: &Connection) -> Result<(), DuckxError> {
-    // PASTE the exact body from spikes/secrets_api/src/main.rs's
-    // `register_redshift_test_secret`, adjusted to register the type name
-    // "REDSHIFT" (not "REDSHIFT_TEST") with the SECRET_FIELDS above.
-    //
-    // Wrap any duckdb / ffi error in DuckxError::RedshiftError.
-    todo!("paste from spikes/secrets_api after Task 2.5 confirms the path")
+    // BEGIN: copied from spikes/secrets_api with type-name changed.
+    // Spike-defined function takes ownership of registering the type with
+    // SECRET_FIELDS. Wrap any duckdb / ffi error in DuckxError::RedshiftError.
+    /* ... body from spike ... */
+    let _ = conn;
+    Err(DuckxError::RedshiftError(
+        "stub — paste from spikes/secrets_api at Task 6 step 4".into(),
+    ))
+    // END
 }
 
 pub fn lookup_secret(conn: &Connection, name: &str) -> Result<Config, DuckxError> {
@@ -1339,10 +1359,13 @@ fn read_secret_fields(
     conn: &Connection,
     name: &str,
 ) -> Result<std::collections::BTreeMap<String, String>, DuckxError> {
-    // PASTE the exact body from spikes/secrets_api/src/main.rs's
-    // `read_secret_fields` (or equivalent), error-wrapped.
+    // BEGIN: copied from spikes/secrets_api.
+    /* ... body from spike ... */
     let _ = (conn, name);
-    todo!("paste from spikes/secrets_api after Task 2.5 confirms the path")
+    Err(DuckxError::RedshiftError(
+        "stub — paste from spikes/secrets_api at Task 6 step 4".into(),
+    ))
+    // END
 }
 
 fn take_field(
@@ -1355,7 +1378,7 @@ fn take_field(
 }
 ```
 
-> The two `todo!()` calls in this file are placeholders for code that comes verbatim from Task 2.5's spike. They MUST be replaced — the test gate at Step 6 will catch it if not.
+The two stub bodies that return `Err(...stub...)` MUST be replaced with the spike's working code. They are NOT `todo!()` so the CI grep gate doesn't fire prematurely; the test gate at Step 6 catches the unreplaced stubs (tests will fail with the stub error message). Leaving stubs that compile-and-error is intentional — they enable incremental commits while making the gap visible.
 
 - [ ] **Step 5: Wire into `lib.rs`**
 
@@ -2606,6 +2629,38 @@ fn partitioned_count_matches_unpartitioned() {
 }
 ```
 
+- [ ] **Step 4b: Bind-time SQL error test**
+
+Add a small test verifying that a syntactically invalid user query surfaces a clean `RedshiftError` from the bind-time `LIMIT 0` probe (not a panic, not a silent empty result). Append to `tests/integration_pg/auth_paths.rs` or a new file `tests/integration_pg/bind_errors.rs` (and add it to `main.rs`):
+
+```rust
+use crate::common::*;
+
+#[test]
+fn bind_time_sql_error_surfaces_cleanly() {
+    let h = start();
+    std::env::set_var("REDSHIFT_HOST", "127.0.0.1");
+    std::env::set_var("REDSHIFT_PORT", h.port.to_string());
+    std::env::set_var("REDSHIFT_USER", "postgres");
+    std::env::set_var("REDSHIFT_PASSWORD", "postgres");
+    std::env::set_var("REDSHIFT_DATABASE", "postgres");
+    std::env::set_var("REDSHIFT_SSLMODE", "disable");
+
+    let sql = format!(
+        "SET allow_unsigned_extensions = true; LOAD '{}'; \
+         SELECT * FROM redshift_scan('SELECT * FROM table_that_does_not_exist');",
+        extension_path().display()
+    );
+    let out = duckdb(&sql);
+    assert!(!out.status.success());
+    let err = String::from_utf8_lossy(&out.stderr).to_lowercase();
+    assert!(err.contains("redshift error") || err.contains("does not exist") || err.contains("relation"),
+        "stderr: {err}");
+}
+```
+
+If you place this in a new file, also add `mod bind_errors;` to `tests/integration_pg/main.rs`.
+
 - [ ] **Step 5: Connection-drop test**
 
 Renamed from "cancellation" — this test validates that a dropped Postgres backend surfaces a clean `RedshiftError`. True user-initiated cancellation (SIGINT mid-stream) is out of scope for v1 because cancellation requires DuckDB-side cooperation we don't yet wire.
@@ -2934,7 +2989,10 @@ Requires:
   re-executes the user query as `MIN/MAX(col) FROM (<query>) t` — pass
   explicit `partition_min` / `partition_max` for expensive queries.
 - `partition_on` must be an integer column. `DATE` / hash / `VARCHAR`
-  partition keys are not supported.
+  partition keys are not supported. NULL values in the partition column
+  are dropped from the result (because `BETWEEN` is `NULL` for them);
+  pre-filter with `WHERE col IS NOT NULL` or use the unpartitioned path
+  if your data contains NULLs.
 - No `statement_timeout` arg — runaway queries cannot be bounded from
   inside DuckDB. Set `statement_timeout` per-user on the cluster instead.
 - No cooperative cancellation — DuckDB `Ctrl-C` does not interrupt an
