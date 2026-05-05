@@ -104,8 +104,9 @@ fn main() {
         use connectorx::sources::postgres::{BinaryProtocol, PostgresSource};
         use connectorx::sql::CXQuery;
         use connectorx::transports::PostgresArrowTransport;
+        use postgres::Config;
         use std::str::FromStr;
-        use tokio_postgres::{Config, NoTls};
+        use tokio_postgres::NoTls;
 
         let cfg = Config::from_str(
             "postgresql://u:p@h:5432/d?sslmode=disable"
@@ -1902,8 +1903,9 @@ use connectorx::destinations::arrow::ArrowDestination;
 use connectorx::sources::postgres::{BinaryProtocol, PostgresSource};
 use connectorx::sql::CXQuery;
 use connectorx::transports::PostgresArrowTransport;
+use postgres::Config as PgConfig;
 use std::str::FromStr;
-use tokio_postgres::{Config as PgConfig, NoTls};
+use tokio_postgres::NoTls;
 
 pub fn run_pipeline(
     cfg: &Config,
