@@ -61,7 +61,7 @@ publish = false
 # Use the version of connectorx we plan to pin in the main crate.
 # The plan author should fill in the exact version here after `cargo search connectorx`.
 connectorx = { version = "0.4", features = ["src_postgres", "dst_arrow"] }
-arrow = "53"
+arrow = "54"
 
 [workspace]
 ```
@@ -93,18 +93,28 @@ fn main() {
     // Also compile-test the production Dispatcher snippet from Task 9.
     // This catches API drift that would otherwise blow up at Task 9.
     // We don't actually run it — we just need the types to resolve.
+    //
+    // Real signature found by spike:
+    //   PostgresSource::<P, C>::new(
+    //       config: tokio_postgres::Config,
+    //       tls: C,                              // C: MakeTlsConnect<Socket> + Clone + 'static + Send + Sync
+    //       nconn: usize,
+    //   ) -> Result<Self, _>
     fn _dispatcher_typecheck() {
-        use connectorx::sources::postgres::{rewrite_tls_args, BinaryProtocol, PostgresSource};
+        use connectorx::sources::postgres::{BinaryProtocol, PostgresSource};
         use connectorx::sql::CXQuery;
         use connectorx::transports::PostgresArrowTransport;
+        use std::str::FromStr;
+        use tokio_postgres::{Config, NoTls};
 
-        let url = url::Url::parse("postgresql://u:p@h:5432/d?sslmode=disable").unwrap();
-        let (cfg_url, _tls): (_, _) = rewrite_tls_args(&url).unwrap();
-        let queries: Vec<CXQuery<String>> = vec![CXQuery::naked("SELECT 1")];
-        let source = PostgresSource::<BinaryProtocol, _>::new(cfg_url, queries.len()).unwrap();
+        let cfg = Config::from_str(
+            "postgresql://u:p@h:5432/d?sslmode=disable"
+        ).unwrap();
+        let queries: Vec<CXQuery<String>> = vec![CXQuery::naked("SELECT 1".to_string())];
+        let source = PostgresSource::<BinaryProtocol, NoTls>::new(cfg, NoTls, queries.len()).unwrap();
         let mut destination = ArrowDestination::new();
         let dispatcher = connectorx::prelude::Dispatcher::<
-            _, _, PostgresArrowTransport<BinaryProtocol, _>,
+            _, _, PostgresArrowTransport<BinaryProtocol, NoTls>,
         >::new(source, &mut destination, &queries, None);
         let _ = dispatcher; // don't run; just typecheck
     }
@@ -503,8 +513,9 @@ redshift-integration = []
 duckdb = { version = "=1.4.0", features = ["vtab", "extension-loadable"] }
 duckdb-loadable-macros = "=0.1.6"
 connectorx = { version = "0.4", features = ["src_postgres", "dst_arrow"] }
-arrow = "53"
+arrow = "54"
 postgres = "0.19"
+tokio-postgres = "0.7"
 postgres-native-tls = "0.5"
 native-tls = "0.2"
 secrecy = "0.10"
@@ -1888,17 +1899,19 @@ use crate::error::DuckxError;
 use crate::partition::PartitionSpec;
 use arrow::record_batch::RecordBatch;
 use connectorx::destinations::arrow::ArrowDestination;
-use connectorx::sources::postgres::{rewrite_tls_args, BinaryProtocol, PostgresSource};
+use connectorx::sources::postgres::{BinaryProtocol, PostgresSource};
 use connectorx::sql::CXQuery;
 use connectorx::transports::PostgresArrowTransport;
+use std::str::FromStr;
+use tokio_postgres::{Config as PgConfig, NoTls};
 
 pub fn run_pipeline(
     cfg: &Config,
     user_query: &str,
     spec: &PartitionSpec,
 ) -> Result<Box<dyn Iterator<Item = Result<RecordBatch, DuckxError>> + Send>, DuckxError> {
-    let queries = match spec {
-        PartitionSpec::Single => vec![CXQuery::naked(user_query)],
+    let queries: Vec<CXQuery<String>> = match spec {
+        PartitionSpec::Single => vec![CXQuery::naked(user_query.to_string())],
         PartitionSpec::Parallel { column, num, bounds } => {
             // bounds MUST be Some here. Callers must run `discover_bounds`
             // and pass an explicit `Parallel { bounds: Some(_) }` spec to
@@ -1912,21 +1925,41 @@ pub fn run_pipeline(
     };
 
     let dsn = cfg.to_postgres_dsn();
-    let (cfg_url, _tls) = rewrite_tls_args(&url::Url::parse(&dsn).unwrap())
-        .map_err(|e| DuckxError::BadDsn(e.to_string()))?;
-    let source = PostgresSource::<BinaryProtocol, _>::new(cfg_url, queries.len())
-        .map_err(|e| DuckxError::RedshiftError(e.to_string()))?;
-    let mut destination = ArrowDestination::new();
-    let dispatcher = connectorx::prelude::Dispatcher::<
-        _, _, PostgresArrowTransport<BinaryProtocol, _>,
-    >::new(source, &mut destination, &queries, None);
-    dispatcher
-        .run()
-        .map_err(|e| DuckxError::RedshiftError(e.to_string()))?;
+    let pg_cfg = PgConfig::from_str(&dsn).map_err(|e| DuckxError::BadDsn(e.to_string()))?;
+    let nconn = queries.len();
 
-    let batches = destination
-        .arrow()
-        .map_err(|e| DuckxError::BatchDecode(e.to_string()))?;
+    // Two TLS branches; connectorx is generic over `MakeTlsConnect`, so the
+    // dispatcher type changes per branch — duplicate the body.
+    let batches = match cfg.sslmode {
+        SslMode::Disable => {
+            let source = PostgresSource::<BinaryProtocol, NoTls>::new(pg_cfg, NoTls, nconn)
+                .map_err(|e| DuckxError::RedshiftError(e.to_string()))?;
+            let mut destination = ArrowDestination::new();
+            let dispatcher = connectorx::prelude::Dispatcher::<
+                _, _, PostgresArrowTransport<BinaryProtocol, NoTls>,
+            >::new(source, &mut destination, &queries, None);
+            dispatcher.run().map_err(|e| DuckxError::RedshiftError(e.to_string()))?;
+            destination.arrow().map_err(|e| DuckxError::BatchDecode(e.to_string()))?
+        }
+        _ => {
+            let connector = native_tls::TlsConnector::builder()
+                // verify-ca / verify-full not fully supported in v1; system trust store only.
+                .build()
+                .map_err(|e| DuckxError::RedshiftError(format!("tls init: {e}")))?;
+            let tls = postgres_native_tls::MakeTlsConnector::new(connector);
+            let source = PostgresSource::<BinaryProtocol, postgres_native_tls::MakeTlsConnector>::new(
+                pg_cfg, tls, nconn,
+            )
+            .map_err(|e| DuckxError::RedshiftError(e.to_string()))?;
+            let mut destination = ArrowDestination::new();
+            let dispatcher = connectorx::prelude::Dispatcher::<
+                _, _, PostgresArrowTransport<BinaryProtocol, postgres_native_tls::MakeTlsConnector>,
+            >::new(source, &mut destination, &queries, None);
+            dispatcher.run().map_err(|e| DuckxError::RedshiftError(e.to_string()))?;
+            destination.arrow().map_err(|e| DuckxError::BatchDecode(e.to_string()))?
+        }
+    };
+
     Ok(Box::new(batches.into_iter().map(Ok)))
 }
 
