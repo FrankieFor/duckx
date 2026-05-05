@@ -6,14 +6,35 @@
 
 **Architecture:** Single Cargo crate (`duckx`) building a `cdylib` `.duckdb_extension` shared library, pinned to one DuckDB version. Uses `connectorx` directly from Rust to extract Redshift query results as Arrow record batches and streams them into DuckDB via the Arrow C-data interface. Credentials resolved from a DuckDB Secret of type `REDSHIFT` or environment variables.
 
-**Tech Stack:** Rust (edition 2021), `duckdb` crate (`vtab` + `extension-loadable` features), `connectorx`, `arrow`, `secrecy`, `thiserror`, `tracing`, `testcontainers` (dev), `pretty_assertions` (dev).
+**Tech Stack:** Rust (edition 2021), `duckdb` crate (`vtab` + `loadable-extension` features), `duckdb-loadable-macros`, `connectorx`, `arrow`, `secrecy`, `thiserror`, `tracing`, `testcontainers` (dev), `pretty_assertions` (dev).
 
 **Spec:** `docs/superpowers/specs/2026-05-05-redshift-extension-design.md`
 
-**Pinned versions (record at impl time, before Task 3):**
-- DuckDB: latest stable at impl time (expected `1.4.x`).
-- `duckdb-rs`: latest version compiled against the pinned DuckDB.
-- `connectorx`: latest published version verified by Task 1.
+**Pinned versions (verified by Tasks 1 + 2 spikes against system DuckDB 1.5.2):**
+- DuckDB: `1.5.2` (system-installed CLI binary).
+- `duckdb-rs` and `duckdb-loadable-macros`: `=1.10502.0` (encoded versioning: `1.10502.0` ↔ DuckDB `1.5.2`).
+- `connectorx`: `0.4.5` (resolved by Cargo); `arrow = "54"` to align with connectorx's transitive `arrow-array 54.x`.
+
+## Status snapshot (2026-05-05, paused after Task 2 build)
+
+The plan was reviewed three times and passed design review. Implementation paused after the first two de-risk spikes. Snapshot of progress:
+
+- **Task 1 (`spikes/arrow_compat`)** — DONE. `cargo check` passes. Beads issue `duckx-hrj.1` closed. Findings folded into this plan: `arrow=54`, `PostgresSource::new(postgres::Config, tls, nconn)` with the SYNC `postgres` crate's `Config`. Bonus: `PostgresSource.pre_execution_queries` exists, so `statement_timeout_ms` is implementable post-v1.
+- **Task 2 (`spikes/hello_extension`)** — BUILDS. `cargo build --release` produces a clean cdylib using the new VTab API surface in duckdb-rs 1.10502.0. **Load test BLOCKED:** DuckDB rejects the cdylib with "metadata at the end of the file is invalid" because `.duckdb_extension` files require a metadata footer that `duckdb-loadable-macros` does NOT generate. Resolving requires either vendoring DuckDB upstream's `append_extension_metadata.py`, writing a Rust-native footer appender (~few hundred lines based on DuckDB's `extension_install.cpp` format), or switching to the alternative crate `quack-rs` which may handle the footer natively.
+
+### Plan deltas not yet propagated below
+
+The Task 2 / Task 10 / Task 11 sections still contain VTab examples in the **older** duckdb-rs API style (raw `*mut data` pointers, `Free` trait, `Connection::register_table_function::<T>(&conn, TableFunction)`). The 1.10502.0 surface is materially different and must be rewritten before those tasks execute:
+
+- `VTab::bind(&BindInfo) -> Result<Self::BindData, _>` returns owned data; no `*mut` parameter.
+- `VTab::init(&InitInfo) -> Result<Self::InitData, _>` returns owned data.
+- `VTab::func(&TableFunctionInfo<Self>, &mut DataChunkHandle)` — `func.get_init_data()` returns `&Self::InitData` immutably; per-scan mutable state needs interior mutability (`AtomicBool`, `Mutex`, etc.).
+- `Self::InitData` and `Self::BindData` must be `Sized + Send + Sync`. No `#[repr(C)]`, no `Free` impl.
+- `Connection::register_table_function::<T>(name: &str)` takes only a name; static `parameters()` / `named_parameters()` methods on the VTab define the signature.
+- `duckdb::core::Inserter` trait must be in scope to call `vector.insert(idx, value)`.
+- Cargo feature is `loadable-extension`, not `extension-loadable`.
+
+The `spikes/hello_extension/src/lib.rs` file is the canonical reference for the corrected pattern; mirror it when writing Task 10's `scan.rs`.
 
 **Parallelism map for `/workflow` Phase 3:**
 
