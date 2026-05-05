@@ -1,0 +1,14 @@
+[package]
+name = "arrow_compat_spike"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+# Use the version of connectorx we plan to pin in the main crate.
+# The plan author should fill in the exact version here after `cargo search connectorx`.
+connectorx = { version = "0.4", features = ["src_postgres", "dst_arrow"] }
+arrow = "53"
+url = "2"
+
+[workspace]
