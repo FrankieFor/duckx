@@ -1,64 +1,61 @@
 # arrow_compat spike
 
 Verifies that `connectorx::destinations::arrow::ArrowDestination` produces
-`arrow`-crate `RecordBatch`es directly (not `arrow2`), AND records whether
-`arrow()` returns a fully-materialized `Vec` or a streaming iterator.
+`arrow`-crate `RecordBatch`es directly (not `arrow2`), and that the
+`PostgresSource` / `Dispatcher` API used in the production `pipeline.rs`
+typechecks against the pinned versions.
 
-## Result (filled in at run time)
+## Result
 
-- connectorx version: UNVERIFIED — `cargo search` / `cargo check` could not be
-  executed in the agent's sandbox (Bash permission denied for cargo and network
-  access denied for crates.io). Plan-recommended version `0.4` left in
-  `Cargo.toml`; orchestrator must pin the exact 0.4.x after running
-  `cargo search connectorx`.
-- arrow version: UNVERIFIED — left at plan default `53`.
-- compat: UNVERIFIED — see blocker note below.
-- destination type: UNVERIFIED at runtime, but the spike asserts at compile
-  time that `ArrowDestination::arrow()` returns `Vec<arrow::record_batch::RecordBatch>`
-  (see `src/main.rs`'s `_proof` coercion). If `cargo check` succeeds with the
-  pinned versions, the answer is `Vec<RecordBatch>` (materialized).
+- **connectorx version:** `0.4.5` (resolved by Cargo).
+- **arrow version:** `54` (pinned to match the `arrow-array 54.x` that
+  connectorx 0.4.5 transitively brings in; pinning `arrow=53` produced a
+  multi-version `arrow_array` mismatch).
+- **compat:** **OK** — `cargo check` passes; `_proof` coercion confirms
+  `ArrowDestination::arrow()` returns `Vec<arrow::record_batch::RecordBatch>`
+  from the same `arrow_array` 54.x crate.
+- **destination type:** `Vec<RecordBatch>` (materialized). connectorx 0.4.5
+  buffers the full result in the destination during `Dispatcher::run()`,
+  then `arrow()` returns the buffer. There is no streaming destination on
+  0.4.x.
 
-## Blocker note (agent run on 2026-05-05)
+## Production API findings (used by Task 9 plan correction)
 
-The spike sources have been written exactly per the plan, but compile-time
-verification (`cargo check`) was NOT performed because the executing agent's
-sandbox blocked `cargo`, `bd`, and outbound HTTP. The spike's value is gated on
-that compile step; running `cargo check` here is mandatory before declaring
-"OK".
+Real `PostgresSource::new` signature on connectorx 0.4.5:
 
-Operator action required:
-
-```bash
-cd spikes/arrow_compat
-cargo search connectorx --limit 10   # confirm latest 0.4.x
-# update Cargo.toml's connectorx version to the pinned 0.4.x if newer
-cargo check
+```rust
+PostgresSource::<P, C>::new(
+    config: postgres::config::Config,   // sync postgres crate, NOT tokio_postgres
+    tls: C,                             // C: MakeTlsConnect<Socket> + Clone + 'static + Send + Sync
+    nconn: usize,
+) -> Result<Self, _>
 ```
 
-If `cargo check` fails with a type mismatch on the `_proof` coercion, the
-arrow-vs-arrow2 split is real and the workflow must STOP per the plan's
-Task 1 stop condition.
+The plan's earlier `(cfg_url, queries.len())` form was wrong. `pipeline.rs`
+must:
 
-## Implications
+1. Build `postgres::Config` from the URL via `FromStr`.
+2. Pass an explicit TLS connector (`tokio_postgres::NoTls` for
+   `sslmode=disable`, or `postgres_native_tls::MakeTlsConnector` for
+   `require`/`verify-*`).
+3. Pass `nconn = queries.len()` as a separate `usize` arg.
 
-If destination type is `Vec<RecordBatch>` (likely on 0.4): the spec's
-Memory Model section's claim "no batch is ever fully materialized" is
-WRONG and must be updated to:
+Bonus finding: `PostgresSource` exposes a `pre_execution_queries: Option<Vec<String>>`
+field. This means `statement_timeout_ms` (deferred to Future Work) IS
+implementable via a pre-execution `SET statement_timeout = N` injected per
+connection — worth revisiting post-v1.
 
-> connectorx materializes the full result set in `ArrowDestination`
-> during the dispatcher's `run()`. After dispatch, our iterator walks
-> the resulting `Vec<RecordBatch>` and emits batches into DuckDB chunk
-> at a time. Peak memory is therefore the full result set size, not
-> `partition_num × batch`. For very large extracts, prefer `UNLOAD` +
-> `read_parquet` (already documented as a non-goal).
+## Implications for spec
 
-If a streaming destination is available, prefer it.
+The Memory Model section in
+`docs/superpowers/specs/2026-05-05-redshift-extension-design.md` already
+reflects "destination materializes full result set" — no further spec
+change needed from this spike. Plan corrections (arrow=54, real
+PostgresSource signature) are committed in
+`d1ec711` ("fix(plan): correct connectorx 0.4.5 API per Task 1 spike findings").
 
 ## Decision
 
-If compat is OK: proceed to main implementation, depend on `arrow` crate only.
-If REWRAP: add a small `arrow2 -> arrow` shim in `pipeline.rs` (~5% perf cost).
-If BLOCKED: stop the workflow and re-brainstorm.
-
-If destination is `Vec`: update `docs/superpowers/specs/2026-05-05-redshift-extension-design.md`
-Memory Model section before continuing to Task 2.
+**Proceed to Task 2.** Compat is OK; main implementation depends on
+`arrow = "54"` and constructs `PostgresSource` per the corrected
+signature.
