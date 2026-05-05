@@ -1,0 +1,31 @@
+{
+  "idea": "create logic where i can directly query aws redshift from duckdb",
+  "phase": "paused",
+  "paused_at": "2026-05-05",
+  "paused_reason": "Stopping with clean snapshot per user. Task 1 done+merged+closed; Task 2 builds but cannot LOAD due to missing metadata footer tooling (duckdb-loadable-macros does not append the .duckdb_extension footer; upstream DuckDB ships a Python script for this that we have not vendored). Plan updated with verified API drifts (arrow=54, real PostgresSource signature, DuckDB 1.5.2/duckdb-rs 1.10502.0, new VTab API). Resume by resolving the metadata-footer tool first, then rewriting Task 10/11 VTab code against the 1.10502.0 surface (spikes/hello_extension/src/lib.rs is the canonical pattern).",
+  "original_phase": "dispatch",
+  "spec_path": "docs/superpowers/specs/2026-05-05-redshift-extension-design.md",
+  "plan_path": "docs/superpowers/plans/2026-05-05-redshift-extension-plan.md",
+  "epic": "redshift-extension",
+  "epic_id": "duckx-hrj",
+  "workflow_branch": "workflow/redshift-extension",
+  "task_ids": [
+    "duckx-hrj.1",
+    "duckx-hrj.2",
+    "duckx-hrj.3",
+    "duckx-hrj.4",
+    "duckx-hrj.5",
+    "duckx-hrj.6",
+    "duckx-hrj.7",
+    "duckx-hrj.8",
+    "duckx-hrj.9",
+    "duckx-hrj.10",
+    "duckx-hrj.11",
+    "duckx-hrj.12",
+    "duckx-hrj.13",
+    "duckx-hrj.14",
+    "duckx-hrj.15"
+  ],
+  "dispatched": ["duckx-hrj.1"],
+  "merged": ["duckx-hrj.1"]
+}

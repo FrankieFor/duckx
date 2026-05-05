@@ -1,0 +1,15 @@
+[package]
+name = "hello_extension_spike"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+# duckdb-rs uses encoded versioning: 1.10502.0 == DuckDB 1.5.2.
+duckdb = { version = "=1.10502.0", features = ["vtab", "loadable-extension"] }
+duckdb-loadable-macros = "=1.10502.0"
+
+[workspace]

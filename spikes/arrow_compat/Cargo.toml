@@ -1,0 +1,14 @@
+[package]
+name = "arrow_compat_spike"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+connectorx = { version = "0.4", features = ["src_postgres", "dst_arrow"] }
+arrow = "54"
+url = "2"
+tokio-postgres = "0.7"
+postgres = "0.19"
+
+[workspace]
