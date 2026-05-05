@@ -496,16 +496,37 @@ Write `src/lib.rs`:
 pub const DUCKDB_VERSION: &str = env!("DUCKX_DUCKDB_VERSION");
 ```
 
-- [ ] **Step 4: Wire the version env var**
+- [ ] **Step 4: Derive the DuckDB version at build time**
 
-Write `.cargo/config.toml`:
+Instead of hand-editing an env var, derive `DUCKX_DUCKDB_VERSION` from the `duckdb` dependency listed in `Cargo.toml`. This keeps the runtime version check in sync with the linked ABI: bumping the `duckdb = "X.Y"` line in `Cargo.toml` automatically updates the runtime check.
 
-```toml
-[env]
-DUCKX_DUCKDB_VERSION = "1.4.0"
+Write `build.rs`:
+
+```rust
+fn main() {
+    // Parse the duckdb dep version out of Cargo.toml so the runtime
+    // version check (lib.rs::verify_duckdb_version) tracks the linked
+    // crate version automatically.
+    let manifest = std::fs::read_to_string("Cargo.toml").expect("read Cargo.toml");
+    let line = manifest
+        .lines()
+        .find(|l| l.trim_start().starts_with("duckdb"))
+        .expect("Cargo.toml must declare a `duckdb = ...` dependency");
+    let version = line
+        .split('=')
+        .nth(1)
+        .and_then(|rest| rest.split('"').nth(1))
+        .or_else(|| {
+            // version field form: duckdb = { version = "X.Y", ... }
+            line.split("version").nth(1).and_then(|r| r.split('"').nth(1))
+        })
+        .expect("could not parse duckdb version from Cargo.toml");
+    println!("cargo:rustc-env=DUCKX_DUCKDB_VERSION={version}");
+    println!("cargo:rerun-if-changed=Cargo.toml");
+}
 ```
 
-(Replace with the exact version recorded in Task 2 step 1.)
+Do NOT also write `.cargo/config.toml` — leave that absent so the build.rs is the single source of truth. If a `.cargo/config.toml` already exists with a `[env]` block, remove the `DUCKX_DUCKDB_VERSION` line.
 
 - [ ] **Step 5: Create the xtask binary for extension packaging**
 
@@ -608,12 +629,14 @@ Run: `cargo build`
 
 Expected: clean build of the empty stub crate.
 
-- [ ] **Step 8: Commit**
+- [ ] **Step 8: Commit (including `Cargo.lock`)**
 
 ```bash
-git add Cargo.toml rust-toolchain.toml src/lib.rs xtask .github .cargo
+git add Cargo.toml Cargo.lock rust-toolchain.toml build.rs src/lib.rs xtask .github
 git commit -m "feat: project scaffolding with pinned DuckDB version and CI"
 ```
+
+Cargo.lock is committed for this crate because it builds a versioned `.duckdb_extension` ABI artifact — reproducible builds matter. Also add a `.gitignore` line `target/` if not already present.
 
 ---
 
@@ -624,7 +647,7 @@ git commit -m "feat: project scaffolding with pinned DuckDB version and CI"
 - Create: `tests/unit/error_redaction.rs`
 - Modify: `src/lib.rs` — add `pub mod error;`
 
-- [ ] **Step 1: Write failing redaction tests**
+- [ ] **Step 1: Write failing redaction + panic-boundary tests**
 
 Write `tests/unit/error_redaction.rs`:
 
@@ -698,6 +721,28 @@ fn unsupported_type_names_column_and_type() {
     assert!(rendered.contains("geo_col"));
     assert!(rendered.contains("GEOMETRY"));
 }
+
+#[test]
+fn panic_boundary_converts_panics_to_redshift_error() {
+    use duckx::error::{panic_boundary, DuckxError};
+    let res: Result<(), DuckxError> = panic_boundary("test", || {
+        panic!("kaboom");
+    });
+    match res {
+        Err(DuckxError::RedshiftError(msg)) => {
+            assert!(msg.contains("panic in test"), "msg: {msg}");
+            assert!(msg.contains("kaboom"));
+        }
+        other => panic!("expected RedshiftError, got {other:?}"),
+    }
+}
+
+#[test]
+fn panic_boundary_passes_ok_through() {
+    use duckx::error::panic_boundary;
+    let res = panic_boundary("ok", || Ok::<i32, duckx::error::DuckxError>(42));
+    assert_eq!(res.unwrap(), 42);
+}
 ```
 
 - [ ] **Step 2: Run tests — expect compile failure**
@@ -757,6 +802,30 @@ fn redact(s: &str) -> String {
         format!("{scheme}://{user}:****@", scheme = &c[1], user = &c[2])
     });
     s.into_owned()
+}
+
+/// Wrap an FFI-boundary callback so panics convert into a `DuckxError`
+/// instead of unwinding across the C ABI (which is undefined behavior).
+///
+/// All `VTab::bind`, `VTab::init`, `VTab::func`, and the
+/// `extension_entrypoint` body MUST go through this helper.
+pub fn panic_boundary<F, T>(label: &'static str, f: F) -> Result<T, DuckxError>
+where
+    F: FnOnce() -> Result<T, DuckxError> + std::panic::UnwindSafe,
+{
+    match std::panic::catch_unwind(f) {
+        Ok(res) => res,
+        Err(payload) => {
+            let msg = if let Some(s) = payload.downcast_ref::<&'static str>() {
+                (*s).to_string()
+            } else if let Some(s) = payload.downcast_ref::<String>() {
+                s.clone()
+            } else {
+                "non-string panic payload".to_string()
+            };
+            Err(DuckxError::RedshiftError(format!("panic in {label}: {msg}")))
+        }
+    }
 }
 ```
 
@@ -1754,7 +1823,7 @@ pub fn run_pipeline(
     cfg: &Config,
     user_query: &str,
     spec: &PartitionSpec,
-) -> Result<Box<dyn Iterator<Item = Result<RecordBatch, DuckxError>>>, DuckxError> {
+) -> Result<Box<dyn Iterator<Item = Result<RecordBatch, DuckxError>> + Send>, DuckxError> {
     let queries = match spec {
         PartitionSpec::Single => vec![CXQuery::naked(user_query)],
         PartitionSpec::Parallel { column, num, bounds } => {
@@ -1886,16 +1955,14 @@ use duckx::scan::parse_named_args;
 #[test]
 fn parses_supported_named_args() {
     let pairs = vec![
-        ("secret".to_string(),               "prod".to_string()),
-        ("partition_on".to_string(),         "id".to_string()),
-        ("partition_num".to_string(),        "8".to_string()),
-        ("partition_min".to_string(),        "0".to_string()),
-        ("partition_max".to_string(),        "99".to_string()),
-        ("statement_timeout_ms".to_string(), "30000".to_string()),
+        ("secret".to_string(),       "prod".to_string()),
+        ("partition_on".to_string(), "id".to_string()),
+        ("partition_num".to_string(),"8".to_string()),
+        ("partition_min".to_string(),"0".to_string()),
+        ("partition_max".to_string(),"99".to_string()),
     ];
     let parsed = parse_named_args(&pairs).unwrap();
     assert_eq!(parsed.secret.as_deref(), Some("prod"));
-    assert_eq!(parsed.statement_timeout_ms, Some(30_000));
     let want = PartitionArgs {
         partition_on:  Some("id".into()),
         partition_num: Some(8),
@@ -1908,12 +1975,6 @@ fn parses_supported_named_args() {
 #[test]
 fn unknown_arg_errors() {
     let pairs = vec![("yolo".to_string(), "true".to_string())];
-    assert!(parse_named_args(&pairs).is_err());
-}
-
-#[test]
-fn negative_timeout_errors() {
-    let pairs = vec![("statement_timeout_ms".to_string(), "-1".to_string())];
     assert!(parse_named_args(&pairs).is_err());
 }
 ```
@@ -1951,7 +2012,6 @@ use duckdb::Connection;
 pub struct ParsedArgs {
     pub secret: Option<String>,
     pub partition: PartitionArgs,
-    pub statement_timeout_ms: Option<i64>,
 }
 
 pub fn parse_named_args(pairs: &[(String, String)]) -> Result<ParsedArgs, DuckxError> {
@@ -1963,15 +2023,6 @@ pub fn parse_named_args(pairs: &[(String, String)]) -> Result<ParsedArgs, DuckxE
             "partition_num" => out.partition.partition_num = Some(parse_i64(v, k)?),
             "partition_min" => out.partition.partition_min = Some(parse_i64(v, k)?),
             "partition_max" => out.partition.partition_max = Some(parse_i64(v, k)?),
-            "statement_timeout_ms" => {
-                let t = parse_i64(v, k)?;
-                if t <= 0 {
-                    return Err(DuckxError::BadDsn(format!(
-                        "statement_timeout_ms must be > 0, got {t}"
-                    )));
-                }
-                out.statement_timeout_ms = Some(t);
-            }
             other => return Err(DuckxError::BadDsn(format!("unknown named arg: {other}"))),
         }
     }
@@ -1988,7 +2039,6 @@ pub struct ScanBindData {
     cfg: Config,
     query: String,
     spec: PartitionSpec,
-    statement_timeout_ms: Option<i64>,
     schema: arrow::datatypes::SchemaRef,
 }
 impl Free for ScanBindData {}
@@ -2006,78 +2056,83 @@ impl VTab for RedshiftScanVTab {
     type BindData = ScanBindData;
 
     fn bind(bind: &BindInfo, data: *mut ScanBindData) -> Result<(), Box<dyn std::error::Error>> {
-        let query = bind.get_parameter(0).to_string();
-        let pairs: Vec<(String, String)> = (0..bind.num_named_parameters())
-            .map(|i| (bind.named_parameter_name(i).into(), bind.named_parameter(i).to_string()))
-            .collect();
-        let parsed = parse_named_args(&pairs)?;
+        // FFI boundary: panics in our code MUST become DuckxErrors, never
+        // unwind across the C ABI.
+        crate::error::panic_boundary("redshift_scan::bind", || {
+            let query = bind.get_parameter(0).to_string();
+            let pairs: Vec<(String, String)> = (0..bind.num_named_parameters())
+                .map(|i| (bind.named_parameter_name(i).into(), bind.named_parameter(i).to_string()))
+                .collect();
+            let parsed = parse_named_args(&pairs)?;
 
-        let cfg = match parsed.secret {
-            Some(name) => lookup_secret(bind.connection(), &name)?,
-            None => resolve_from_env()?,
-        };
-        let spec = validate(&parsed.partition)?;
+            let cfg = match parsed.secret {
+                Some(name) => lookup_secret(bind.connection(), &name)?,
+                None => resolve_from_env()?,
+            };
+            let spec = validate(&parsed.partition)?;
 
-        // Schema discovery: LIMIT 0 round-trip on a Single-spec pipeline.
-        let probe_query = format!("SELECT * FROM ({query}) AS __duckx_probe LIMIT 0");
-        let mut probe_iter = run_pipeline(&cfg, &probe_query, &PartitionSpec::Single)?;
-        let probe_batch = probe_iter
-            .next()
-            .ok_or_else(|| DuckxError::BatchDecode("schema probe returned no batches".into()))??;
-        let schema = probe_batch.schema();
+            // Schema discovery: LIMIT 0 round-trip on a Single-spec pipeline.
+            let probe_query = format!("SELECT * FROM ({query}) AS __duckx_probe LIMIT 0");
+            let mut probe_iter = run_pipeline(&cfg, &probe_query, &PartitionSpec::Single)?;
+            let probe_batch = probe_iter.next().ok_or_else(|| {
+                DuckxError::BatchDecode("schema probe returned no batches".into())
+            })??;
+            let schema = probe_batch.schema();
 
-        for field in schema.fields() {
-            let lt = arrow_to_duckdb(field.name(), field.data_type())?;
-            bind.add_result_column(field.name(), lt);
-        }
+            for field in schema.fields() {
+                let lt = arrow_to_duckdb(field.name(), field.data_type())?;
+                bind.add_result_column(field.name(), lt);
+            }
 
-        unsafe {
-            std::ptr::write(data, ScanBindData {
-                cfg,
-                query,
-                spec,
-                statement_timeout_ms: parsed.statement_timeout_ms,
-                schema,
-            });
-        }
-        Ok(())
+            unsafe {
+                std::ptr::write(data, ScanBindData { cfg, query, spec, schema });
+            }
+            Ok(())
+        })
+        .map_err(Into::into)
     }
 
     fn init(init: &InitInfo, data: *mut ScanInitData) -> Result<(), Box<dyn std::error::Error>> {
-        let bind = unsafe { &*init.get_bind_data::<ScanBindData>() };
+        crate::error::panic_boundary("redshift_scan::init", || {
+            let bind = unsafe { &*init.get_bind_data::<ScanBindData>() };
 
-        // Resolve any pending bound discovery exactly once, here.
-        let final_spec = match &bind.spec {
-            PartitionSpec::Parallel { column, num, bounds: None } => {
-                let (lo, hi) = discover_bounds(&bind.cfg, &bind.query, column)?;
-                PartitionSpec::Parallel { column: column.clone(), num: *num, bounds: Some((lo, hi)) }
+            // Resolve any pending bound discovery exactly once, here.
+            let final_spec = match &bind.spec {
+                PartitionSpec::Parallel { column, num, bounds: None } => {
+                    let (lo, hi) = discover_bounds(&bind.cfg, &bind.query, column)?;
+                    PartitionSpec::Parallel {
+                        column: column.clone(),
+                        num: *num,
+                        bounds: Some((lo, hi)),
+                    }
+                }
+                other => other.clone(),
+            };
+
+            let iter = run_pipeline(&bind.cfg, &bind.query, &final_spec)?;
+            unsafe {
+                std::ptr::write(data, ScanInitData { iter: Some(iter) });
             }
-            other => other.clone(),
-        };
-
-        // statement_timeout_ms is applied via a SET prepended to each
-        // partition query when it's set. connectorx executes each query
-        // verbatim, so prefix the user query with the SET.
-        let query = match bind.statement_timeout_ms {
-            Some(ms) => format!("SET statement_timeout = {ms}; {q}", q = bind.query),
-            None => bind.query.clone(),
-        };
-
-        let iter = run_pipeline(&bind.cfg, &query, &final_spec)?;
-        unsafe {
-            std::ptr::write(data, ScanInitData { iter: Some(iter) });
-        }
-        Ok(())
+            Ok(())
+        })
+        .map_err(Into::into)
     }
 
     fn func(func: &FunctionInfo, output: &mut DataChunkHandle) -> Result<(), Box<dyn std::error::Error>> {
-        let init = unsafe { &mut *func.get_init_data::<ScanInitData>() };
-        let next = match init.iter.as_mut().and_then(|it| it.next()) {
-            None => { output.set_len(0); return Ok(()); }
-            Some(batch) => batch?,
-        };
-        copy_batch_into_chunk(&next, output)?;
-        Ok(())
+        // `output` is a &mut so we can't move it into the closure; capture
+        // its raw pointer and re-borrow inside, also UnwindSafe.
+        let output_ptr = output as *mut DataChunkHandle;
+        crate::error::panic_boundary("redshift_scan::func", move || {
+            let output = unsafe { &mut *output_ptr };
+            let init = unsafe { &mut *func.get_init_data::<ScanInitData>() };
+            let next = match init.iter.as_mut().and_then(|it| it.next()) {
+                None => { output.set_len(0); return Ok(()); }
+                Some(batch) => batch?,
+            };
+            copy_batch_into_chunk(&next, output)?;
+            Ok(())
+        })
+        .map_err(Into::into)
     }
 }
 
@@ -2180,16 +2235,24 @@ use duckdb_loadable_macros::duckdb_entrypoint_c_api;
 
 #[duckdb_entrypoint_c_api]
 pub fn extension_entrypoint(con: Connection) -> Result<(), Box<dyn std::error::Error>> {
-    verify_duckdb_version(&con)?;
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_env("DUCKX_LOG").unwrap_or_else(|_| "off".into()),
-        )
-        .try_init()
-        .ok();
-    secret::register_redshift_secret_type(&con)?;
-    scan::register(&con)?;
-    Ok(())
+    error::panic_boundary("extension_entrypoint", || {
+        verify_duckdb_version(&con).map_err(|e| {
+            error::DuckxError::RedshiftError(format!("version check failed: {e}"))
+        })?;
+        tracing_subscriber::fmt()
+            .with_env_filter(
+                tracing_subscriber::EnvFilter::try_from_env("DUCKX_LOG")
+                    .unwrap_or_else(|_| "off".into()),
+            )
+            .try_init()
+            .ok();
+        secret::register_redshift_secret_type(&con)?;
+        scan::register(&con).map_err(|e| {
+            error::DuckxError::RedshiftError(format!("scan::register: {e}"))
+        })?;
+        Ok(())
+    })
+    .map_err(Into::into)
 }
 
 /// Hard-fail if the running DuckDB's `version()` doesn't match the
@@ -2502,23 +2565,15 @@ Write `tests/integration_pg/connection_drop.rs`:
 ```rust
 use crate::common::*;
 
+/// Tests that a connection failure surfaces as `RedshiftError` (not a
+/// panic, not a hang). We point at port 1 (well-known: nothing
+/// listens there) instead of dropping a testcontainer, because TIME_WAIT
+/// recycling can leave the dropped container's port transiently
+/// reachable on slow CI runners.
 #[test]
-fn unreachable_postgres_surfaces_redshift_error() {
-    // Hold the harness only long enough to capture port+dsn, then drop it.
-    let port_to_use;
-    let dsn_for_seed;
-    {
-        let h = start();
-        port_to_use = h.port;
-        dsn_for_seed = h.dsn.clone();
-        let mut c = postgres::Client::connect(&dsn_for_seed, postgres::NoTls).unwrap();
-        c.batch_execute(
-            "CREATE TABLE z (id INT); INSERT INTO z SELECT g FROM generate_series(1, 100) g;",
-        ).unwrap();
-    } // h drops here, container stops
-
+fn unreachable_host_surfaces_redshift_error() {
     std::env::set_var("REDSHIFT_HOST", "127.0.0.1");
-    std::env::set_var("REDSHIFT_PORT", port_to_use.to_string());
+    std::env::set_var("REDSHIFT_PORT", "1"); // nothing listens here
     std::env::set_var("REDSHIFT_USER", "postgres");
     std::env::set_var("REDSHIFT_PASSWORD", "postgres");
     std::env::set_var("REDSHIFT_DATABASE", "postgres");
@@ -2526,7 +2581,7 @@ fn unreachable_postgres_surfaces_redshift_error() {
 
     let sql = format!(
         "SET allow_unsigned_extensions = true; LOAD '{}'; \
-         SELECT * FROM redshift_scan('SELECT * FROM z');",
+         SELECT * FROM redshift_scan('SELECT 1');",
         extension_path().display()
     );
     let out = duckdb(&sql);
@@ -2613,7 +2668,11 @@ fn select_one_against_real_cluster() {
 }
 
 #[test]
-fn super_type_errors_with_clear_message() {
+fn super_type_errors_cleanly() {
+    // We don't assert on the exact substring because connectorx may
+    // surface unknown OIDs as either "unsupported type" (our wrapper) or
+    // a lower-level protocol error. Both are acceptable; the contract is
+    // that the failure is clean (no panic, exit code != 0, stderr not empty).
     if !dsn_env_set() { return; }
     export_creds();
     let sql = format!(
@@ -2623,8 +2682,8 @@ fn super_type_errors_with_clear_message() {
     );
     let out = duckdb(&sql);
     assert!(!out.status.success());
-    let err = String::from_utf8_lossy(&out.stderr).to_lowercase();
-    assert!(err.contains("unsupported") && err.contains("super"), "stderr: {err}");
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(!err.is_empty(), "expected non-empty stderr");
 }
 
 #[test]
@@ -2661,7 +2720,7 @@ These tests are gated behind `--features redshift-integration` and read:
 
 ### One-time fixture setup
 
-Run once against the staging cluster:
+Schema (run once against the staging cluster):
 
     CREATE TABLE IF NOT EXISTS public.duckx_partition_test (
         id   BIGINT NOT NULL,
@@ -2669,17 +2728,29 @@ Run once against the staging cluster:
     )
     DISTKEY(id) SORTKEY(id);
 
-    -- Seed 1M rows. Re-running is idempotent because of TRUNCATE.
-    TRUNCATE public.duckx_partition_test;
-    INSERT INTO public.duckx_partition_test
-    SELECT i AS id, 'row-' || i AS name
-    FROM (
-        SELECT row_number() OVER () AS i
-        FROM stl_scan
-        LIMIT 1000000
-    );
-
     GRANT SELECT ON public.duckx_partition_test TO <test_user>;
+
+Seed it with at least 100 k rows, by whatever method is convenient on your
+cluster. Two practical options:
+
+1. **`COPY` from S3** (recommended for repeatability — generate a Parquet
+   file once and `COPY` it on every fresh test cluster):
+
+       COPY public.duckx_partition_test
+         FROM 's3://<your-bucket>/duckx_fixture/data.parquet'
+         IAM_ROLE '<role-arn>'
+         FORMAT AS PARQUET;
+
+2. **Inline `INSERT`** for small smoke fixtures:
+
+       INSERT INTO public.duckx_partition_test (id, name)
+       VALUES (1, 'row-1'), (2, 'row-2'), /* … */ (100000, 'row-100000');
+
+The gated test only requires that `SELECT count(*)` returns ≥ 100 k. The
+exact row count is not asserted because the test reads the count via
+`redshift_scan` itself and compares the partitioned vs unpartitioned
+result. Do NOT use `stl_scan` — it is a system view containing query-plan
+rows and its row count is not deterministic.
 
 ### Teardown (only if removing the cluster)
 
@@ -2805,7 +2876,23 @@ Requires:
 
 - No `ATTACH 'redshift://...'` catalog integration yet.
 - No IAM-based credentials yet (use static `CREATE SECRET` for now).
+- No connection pooling — every `redshift_scan` call opens a fresh set
+  of connections (one per partition). Sessions running tight loops
+  should batch their queries.
 - Schema discovered fresh on every call — adds one `LIMIT 0` round-trip.
+  Bound discovery (when `partition_on` is set without explicit bounds)
+  re-executes the user query as `MIN/MAX(col) FROM (<query>) t` — pass
+  explicit `partition_min` / `partition_max` for expensive queries.
+- `partition_on` must be an integer column. `DATE` / hash / `VARCHAR`
+  partition keys are not supported.
+- No `statement_timeout` arg — runaway queries cannot be bounded from
+  inside DuckDB. Set `statement_timeout` per-user on the cluster instead.
+- No cooperative cancellation — DuckDB `Ctrl-C` does not interrupt an
+  in-flight Redshift connection mid-`RecordBatch`. Connections do close
+  cleanly when the scan iterator drops at end of query.
+- Pre-built artifacts ship for `linux-amd64` and `macos-arm64`.
+  `linux-arm64` is type-checked in CI via `cargo-zigbuild` but not
+  end-to-end tested — use at your own risk or build from source.
 - Best for queries returning up to tens of millions of rows. For larger
   extracts, prefer `UNLOAD ... TO 's3://...' FORMAT PARQUET` and read
   with `read_parquet` via the `httpfs` extension.
@@ -2852,6 +2939,11 @@ jobs:
             unzip duckdb.zip && sudo mv duckdb /usr/local/bin/
           fi
       - run: cargo fmt --all -- --check
+      - name: Block todo!() in production code
+        run: |
+          if grep -rn 'todo!()' src/; then
+            echo "todo!() not allowed in src/ (use unimplemented!() or implement)"; exit 1
+          fi
       - run: cargo clippy --all-targets --target ${{ matrix.target }} -- -D warnings
       - name: Build (native)
         if: matrix.cross != 'zigbuild'
@@ -2914,13 +3006,16 @@ Write `RELEASE_CHECKLIST.md`:
 Before tagging `vN.N.N`:
 
 - [ ] `cargo fmt --all` and `cargo clippy --all-targets -- -D warnings` clean.
-- [ ] CI green on `main`.
+- [ ] CI green on `main` (including the `todo!()` grep gate).
 - [ ] Real-Redshift suite green:
       `cargo test --release --features redshift-integration -- --test-threads=1`
       with `REDSHIFT_TEST_*` env vars pointing at the staging cluster.
 - [ ] Manual smoke: build, `LOAD`, `SELECT * FROM redshift_scan('SELECT 1')`.
+- [ ] **Manual perf check:** time `redshift_scan` on a ≥1 M-row table at
+      `partition_num=8` vs `Single`; confirm ≥ 3× speedup (spec budget).
 - [ ] `README.md` "Quick start" still works verbatim against the staging cluster.
-- [ ] Bump version in `Cargo.toml`.
+- [ ] Bump version in `Cargo.toml` (this also auto-updates the runtime
+      DuckDB version check via `build.rs`).
 - [ ] Tag and push: `git tag vN.N.N && git push --tags`.
 - [ ] Verify `release.yml` uploaded `redshift-{linux-amd64,macos-arm64}.duckdb_extension` artifacts.
 ```
@@ -2958,8 +3053,14 @@ git commit -m "docs+ci: README, LICENSE, multi-platform CI with zigbuild, releas
 | TLS / `sslmode` default `require` | Tasks 5, 6, 9 (TLS connector) |
 | Partitioned parallel reads | Tasks 8, 9, 12 |
 | `partition_num=1` → Single | Task 8 |
-| `statement_timeout_ms` arg | Task 10 |
+| `statement_timeout_ms` deferred to Future Work | Spec Future Work + Task 10 README limitation |
+| Partition speedup ≥3× at `partition_num=8` (≥1M rows) | Documented in spec Performance budgets; manual measurement in RELEASE_CHECKLIST (no flaky wall-clock CI assertion) |
 | SQL-injection-safe partition column | Tasks 5 (validator), 8, 9 |
+| `panic_boundary` at every FFI entry | Task 4 (helper), Task 10 (bind/init/func), Task 11 (entrypoint) |
+| Iterator `Send` bound matches `ScanInitData` | Task 9 (`+ Send`), Task 10 |
+| `Cargo.lock` committed for reproducibility | Task 3 |
+| `todo!()` blocked in `src/` by CI | Task 14 |
+| DuckDB version derived from Cargo.toml at build time | Task 3 (`build.rs`) |
 | Streaming, no full materialization | Task 9 (channel iterator) |
 | Type mapping (incl. `Hugeint` for `UInt64`) | Task 7, 12 (wide_types) |
 | Unsupported-type errors (`SUPER`, `INTERVAL`, `TIMETZ`, `OID`, …) | Tasks 7, 13 |

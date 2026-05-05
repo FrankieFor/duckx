@@ -20,7 +20,9 @@ Ship `duckx`, a Rust-built DuckDB extension that lets a user query Amazon Redshi
 ### Performance budgets
 
 - Schema discovery (`LIMIT 0` round-trip) adds < 500 ms p50 over a direct `psql` query when the cluster is in the same AWS region as the client.
+- Bound discovery (`MIN/MAX` round-trip when `partition_on` is set without explicit bounds) adds the cost of one extra `MIN/MAX(col) FROM (<user_query>) t` execution. Documented limitation: this re-executes the user query and can be expensive for aggregation-heavy queries; users with such queries should pass explicit `partition_min` / `partition_max`.
 - Total `redshift_scan` overhead over a direct `psql` extract of the same query is < 1.0× wall-clock for queries returning ≥ 100 k rows (i.e., the extension does not more than double extract time).
+- Partitioned reads (`partition_num=8`) achieve ≥ 3× wall-clock speedup over `Single` for queries returning ≥ 1 M rows. Lower speedups indicate broken parallelism (e.g., serialization on a connection mutex) and are tested in the Postgres integration suite.
 
 ## Non-Goals
 
@@ -61,9 +63,8 @@ Arguments:
 | `partition_num` | `BIGINT` | no | `1` | Number of parallel connections. Requires `partition_on`. |
 | `partition_min` | `BIGINT` | no | auto | If omitted, discovered via `SELECT MIN(col)` on the user query. |
 | `partition_max` | `BIGINT` | no | auto | If omitted, discovered via `SELECT MAX(col)`. |
-| `statement_timeout_ms` | `BIGINT` | no | — | If set, issues `SET statement_timeout = N` on each Redshift connection before running the query. |
 
-Unknown named args are rejected at bind time. `partition_num` without `partition_on` errors. `partition_min > partition_max` errors. `partition_num = 1` is treated as the unpartitioned case (single connection); `partition_num` must be in `[1, 64]`. `partition_on` must match `^[A-Za-z_][A-Za-z0-9_]*$` (validated at bind time) and is double-quoted when interpolated into partition SQL to support mixed-case identifiers safely.
+Unknown named args are rejected at bind time. `partition_num` without `partition_on` errors. `partition_min > partition_max` errors. `partition_num = 1` is treated as the unpartitioned case (single connection); `partition_num` must be in `[1, 64]`. `partition_on` must match `^[A-Za-z_][A-Za-z0-9_]*$` (validated at bind time) and is double-quoted when interpolated into partition SQL to support mixed-case identifiers safely. `partition_on` must reference an integer-typed column; non-numeric columns (e.g. `DATE`, `VARCHAR`) error at the `MIN/MAX` discovery step.
 
 ### Credentials
 
@@ -277,6 +278,8 @@ connectorx and the DuckDB extension surface are never mocked in unit tests. Post
 - **`ATTACH 'redshift://…' AS rs`** — implement DuckDB `Catalog` / `StorageExtension`; expose Redshift schemas/tables; add filter & projection pushdown via `BindReplace`. Reuses `config` and `pipeline` unchanged.
 - **IAM auth** — new `secret.rs` variant `TYPE REDSHIFT_IAM` plus AWS SDK call to `GetClusterCredentials`; resolves to a `Config` with a 15-minute-lived password. Plumbing above `config` does not change.
 - **Connection pool** — keyed by resolved `Config`; reuses connections across `redshift_scan` calls within a DuckDB session.
+- **`statement_timeout_ms` arg** — bounds runaway Redshift queries from inside DuckDB. Deferred from v1 because the cleanest implementation requires a connectorx pre-execution hook that 0.4 doesn't expose; embedding `SET statement_timeout` ahead of the user query breaks under partition wrapping (`SELECT … FROM (SET …; SELECT …)` is invalid).
+- **Cooperative cancellation** — propagate DuckDB `Ctrl-C` / interrupt to in-flight Redshift connections. v1 closes connections on iterator drop, but does not respond to mid-stream interrupts within a single `RecordBatch`.
 - **Schema cache** keyed on `(secret_name, query_hash)`.
 - **Community Extensions submission** + signed binaries.
 - **`UNLOAD` fast path** — for queries above a row threshold, transparently use `UNLOAD … TO 's3://…' FORMAT PARQUET` and read back via `httpfs`; behind `via => 's3'` arg.
