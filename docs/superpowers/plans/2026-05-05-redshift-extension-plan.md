@@ -213,8 +213,9 @@ publish = false
 crate-type = ["cdylib"]
 
 [dependencies]
-# Pin to the duckdb-rs release that targets the recorded DuckDB version.
-duckdb = { version = "1.4", features = ["vtab", "extension-loadable"] }
+# duckdb-rs uses encoded versioning: 1.10502.0 == DuckDB 1.5.2.
+duckdb = { version = "=1.10502.0", features = ["vtab", "extension-loadable"] }
+duckdb-loadable-macros = "=1.10502.0"
 
 [workspace]
 ```
@@ -391,7 +392,7 @@ edition = "2021"
 publish = false
 
 [dependencies]
-duckdb = { version = "1.4", features = ["bundled"] }
+duckdb = { version = "=1.10502.0", features = ["bundled"] }
 
 [workspace]
 ```
@@ -511,8 +512,8 @@ default = []
 redshift-integration = []
 
 [dependencies]
-duckdb = { version = "=1.4.0", features = ["vtab", "extension-loadable"] }
-duckdb-loadable-macros = "=0.1.6"
+duckdb = { version = "=1.10502.0", features = ["vtab", "extension-loadable"] }
+duckdb-loadable-macros = "=1.10502.0"
 connectorx = { version = "0.4", features = ["src_postgres", "dst_arrow"] }
 arrow = "54"
 postgres = "0.19"
@@ -684,7 +685,7 @@ jobs:
           if [ "$RUNNER_OS" = "macOS" ]; then
             brew install duckdb
           else
-            curl -L -o duckdb.zip https://github.com/duckdb/duckdb/releases/download/v1.4.0/duckdb_cli-linux-amd64.zip
+            curl -L -o duckdb.zip https://github.com/duckdb/duckdb/releases/download/v1.5.2/duckdb_cli-linux-amd64.zip
             unzip duckdb.zip && sudo mv duckdb /usr/local/bin/
           fi
       - run: cargo fmt --all -- --check
@@ -3078,7 +3079,7 @@ jobs:
           if [ "$RUNNER_OS" = "macOS" ]; then
             brew install duckdb
           else
-            curl -L -o duckdb.zip "https://github.com/duckdb/duckdb/releases/download/v1.4.0/${{ matrix.duckdb_asset }}"
+            curl -L -o duckdb.zip "https://github.com/duckdb/duckdb/releases/download/v1.5.2/${{ matrix.duckdb_asset }}"
             unzip duckdb.zip && sudo mv duckdb /usr/local/bin/
           fi
       - run: cargo fmt --all -- --check
