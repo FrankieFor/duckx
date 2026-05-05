@@ -18,16 +18,16 @@
 **Parallelism map for `/workflow` Phase 3:**
 
 ```
-Task 1 ──▶ Task 2 ──▶ Task 3 ──▶ Task 4 ──┬─▶ Task 5  (config)    ─┐
-                                          ├─▶ Task 6  (secret)    ─┤
-                                          ├─▶ Task 7  (types)     ─┼─▶ Task 9 (pipeline) ─┐
-                                          └─▶ Task 8  (partition) ─┘                     ├─▶ Task 10 (scan) ─▶ Task 11 (lib) ─┬─▶ Task 12 (PG tests)   ─┐
-                                                                                          │                                    ├─▶ Task 13 (RS tests)   ─┤
-                                                                                          │                                    └─▶ Task 14 (README+CI)  ─┤
-                                                                                          └────────────────────────────────────────────────────────────┘
+Task 1 ──▶ Task 2 ──▶ Task 2.5 ──▶ Task 3 ──▶ Task 4 ──┬─▶ Task 5  (config)    ─┐
+                                                       ├─▶ Task 6  (secret)    ─┤
+                                                       ├─▶ Task 7  (types)     ─┼─▶ Task 9 (pipeline) ─┐
+                                                       └─▶ Task 8  (partition) ─┘                     ├─▶ Task 10 (scan) ─▶ Task 11 (lib) ─┬─▶ Task 12 (PG tests)   ─┐
+                                                                                                       │                                    ├─▶ Task 13 (RS tests)   ─┤
+                                                                                                       │                                    └─▶ Task 14 (README+CI)  ─┤
+                                                                                                       └────────────────────────────────────────────────────────────┘
 ```
 
-Tasks 5/6/7/8 run in parallel after Task 4. Tasks 12/13/14 run in parallel after Task 11. Task 9 needs 5 + 7. Task 10 needs 5/6/7/8/9.
+Task 2.5 (Secrets API spike) is the third de-risk gate. Tasks 5/6/7/8 run in parallel after Task 4. Tasks 12/13/14 run in parallel after Task 11. Task 9 needs 5 + 7. Task 10 needs 5/6/7/8/9. Task 6 is unblocked by Task 2.5's outcome.
 
 ---
 
@@ -294,6 +294,121 @@ git commit -m "spike: hello-world DuckDB Rust extension proves load + table func
 
 ---
 
+## Task 2.5: De-risk spike — DuckDB Secrets API surface
+
+**Why this exists:** Task 6 (`secret.rs`) depends on the duckdb-rs Secrets API, which is in flux: some versions expose `Connection::register_secret_type`, others require dropping to FFI (`duckdb::ffi::duckdb_secret_type` + `duckdb_register_secret_type`), and the SQL view `duckdb_secrets()` does NOT expose individual fields — secret field values are read via the C API on the secret handle, not via SQL. We resolve all three questions here, before committing to a `secret.rs` implementation.
+
+**Files:**
+- Create: `spikes/secrets_api/Cargo.toml`
+- Create: `spikes/secrets_api/src/main.rs`
+- Create: `spikes/secrets_api/README.md`
+
+**Stop condition:** if neither the safe Rust API nor the FFI path can register a secret type with named string fields AND read those fields back, **stop the workflow** and report — Task 6 cannot ship.
+
+- [ ] **Step 1: Create the spike crate**
+
+```bash
+mkdir -p spikes/secrets_api/src
+```
+
+Write `spikes/secrets_api/Cargo.toml`:
+
+```toml
+[package]
+name = "secrets_api_spike"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+duckdb = { version = "1.4", features = ["bundled"] }
+
+[workspace]
+```
+
+- [ ] **Step 2: Probe the API**
+
+Read the docs.rs page for the pinned `duckdb-rs` version (`cargo doc -p duckdb --open` or `https://docs.rs/duckdb/<version>`) and search for `Secret`. Record findings in `spikes/secrets_api/README.md`:
+
+- Does `duckdb::Connection` (or any of its modules) expose a Rust API to register a custom secret type? Note the exact path.
+- If not, what FFI symbols are exported in `duckdb::ffi`? Note the relevant `duckdb_*` symbols (e.g., `duckdb_create_secret_type`, `duckdb_secret_type_add_named_parameter`, `duckdb_register_secret_type`).
+- How is a secret's field value read at lookup time? Look for `duckdb_secret_get_string_value` / `SecretEntry` / `SecretReader` types.
+
+This step is a documentation read; record before writing code.
+
+- [ ] **Step 3: Implement the spike against whichever path the docs reveal**
+
+Write `spikes/secrets_api/src/main.rs` to:
+
+1. Open an in-memory DuckDB connection.
+2. Register a secret type `REDSHIFT_TEST` with string fields `host`, `port`, `user`, `password`, `database`, `sslmode`.
+3. Execute `CREATE SECRET s (TYPE REDSHIFT_TEST, HOST 'h', PORT '5439', USER 'u', PASSWORD 'p', DATABASE 'd', SSLMODE 'require');`
+4. Look up secret `s` and print all six field values to stdout.
+
+Sketch (adapt based on Step 2 findings):
+
+```rust
+use duckdb::Connection;
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let con = Connection::open_in_memory()?;
+    register_redshift_test_secret(&con)?;
+    con.execute_batch(
+        "CREATE SECRET s (TYPE REDSHIFT_TEST,
+            HOST 'h', PORT '5439', USER 'u',
+            PASSWORD 'p', DATABASE 'd', SSLMODE 'require');",
+    )?;
+    let fields = read_secret_fields(&con, "s")?;
+    println!("fields: {fields:?}");
+    assert_eq!(fields.get("host").map(String::as_str), Some("h"));
+    assert_eq!(fields.get("password").map(String::as_str), Some("p"));
+    Ok(())
+}
+
+fn register_redshift_test_secret(con: &Connection) -> Result<(), Box<dyn std::error::Error>> {
+    // FILL IN based on Step 2's API discovery.
+    todo!("implement using whichever API the docs.rs probe revealed")
+}
+
+fn read_secret_fields(
+    con: &Connection,
+    name: &str,
+) -> Result<std::collections::BTreeMap<String, String>, Box<dyn std::error::Error>> {
+    // FILL IN based on Step 2's API discovery.
+    todo!("implement using whichever API the docs.rs probe revealed")
+}
+```
+
+The `todo!()` calls MUST be replaced with real implementations before Step 4. They're left here only because the exact path is determined by Step 2.
+
+- [ ] **Step 4: Run the spike**
+
+Run: `cd spikes/secrets_api && cargo run --release`
+
+Expected: stdout contains `host: "h"`, `password: "p"`, etc.
+
+If the only available path requires unsafe FFI, that is acceptable — record the chosen path in the README. If neither path works (e.g., the API to read field values is private), STOP the workflow.
+
+- [ ] **Step 5: Document the chosen implementation strategy**
+
+In `spikes/secrets_api/README.md`, record:
+
+- **Chosen path:** safe Rust API / FFI / hybrid.
+- **Functions to use in `secret.rs`:** exact names and signatures.
+- **Field-read mechanism:** how `lookup_secret` will read field values back.
+- **Risk:** anything fragile that should be revisited.
+
+This README is the input to Task 6.
+
+- [ ] **Step 6: Commit**
+
+```bash
+git add spikes/secrets_api
+git commit -m "spike: DuckDB Secrets API surface verified for redshift secret type"
+```
+
+---
+
 ## Task 3: Project scaffolding
 
 **Files:**
@@ -330,16 +445,22 @@ duckdb = { version = "1.4", features = ["vtab", "extension-loadable"] }
 duckdb-loadable-macros = "0.1"
 connectorx = { version = "0.4", features = ["src_postgres", "dst_arrow"] }
 arrow = "53"
+postgres = "0.19"
+postgres-native-tls = "0.5"
+native-tls = "0.2"
 secrecy = "0.10"
 thiserror = "2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 url = "2"
+regex = "1"
+once_cell = "1"
 
 [dev-dependencies]
 testcontainers = "0.23"
 testcontainers-modules = { version = "0.11", features = ["postgres"] }
 pretty_assertions = "1"
+serial_test = "3"
 tempfile = "3"
 
 [workspace]
@@ -503,24 +624,58 @@ git commit -m "feat: project scaffolding with pinned DuckDB version and CI"
 - Create: `tests/unit/error_redaction.rs`
 - Modify: `src/lib.rs` — add `pub mod error;`
 
-- [ ] **Step 1: Write failing redaction test**
+- [ ] **Step 1: Write failing redaction tests**
 
 Write `tests/unit/error_redaction.rs`:
 
 ```rust
 use duckx::error::DuckxError;
-use secrecy::SecretString;
 
 #[test]
-fn display_does_not_leak_password_in_redshift_error() {
-    let secret = SecretString::new("hunter2".to_string().into());
-    let err = DuckxError::RedshiftError(format!(
-        "auth failed for user 'analyst' (host=db.aws, password={})",
-        secret.expose_secret_for_test_only()
-    ));
-    // The Display impl should NOT show the literal password.
+fn redacts_keyword_form_password() {
+    let err = DuckxError::RedshiftError(
+        "auth failed for user 'analyst' (host=db.aws, password=hunter2)".into(),
+    );
     let rendered = format!("{err}");
     assert!(!rendered.contains("hunter2"), "leak: {rendered}");
+    assert!(rendered.contains("password=****"), "no redaction marker: {rendered}");
+}
+
+#[test]
+fn redacts_pwd_alias_too() {
+    let err = DuckxError::RedshiftError("connect failed: pwd=s3cr3t!".into());
+    let rendered = format!("{err}");
+    assert!(!rendered.contains("s3cr3t"));
+    assert!(rendered.contains("pwd=****"));
+}
+
+#[test]
+fn redacts_url_form_password() {
+    let err = DuckxError::RedshiftError(
+        "connect failed for postgresql://analyst:hunter2@db.aws:5439/analytics".into(),
+    );
+    let rendered = format!("{err}");
+    assert!(!rendered.contains("hunter2"), "leak: {rendered}");
+    // user must remain
+    assert!(rendered.contains("analyst@") || rendered.contains("analyst:"));
+}
+
+#[test]
+fn redacts_multiple_passwords_in_one_string() {
+    let err = DuckxError::RedshiftError(
+        "first password=alpha; later pwd=beta; tail OK".into(),
+    );
+    let rendered = format!("{err}");
+    assert!(!rendered.contains("alpha"), "leak alpha: {rendered}");
+    assert!(!rendered.contains("beta"), "leak beta: {rendered}");
+    assert!(rendered.contains("tail OK"), "tail dropped: {rendered}");
+}
+
+#[test]
+fn redaction_passthrough_when_no_match() {
+    let err = DuckxError::RedshiftError("plain message with no creds".into());
+    let rendered = format!("{err}");
+    assert!(rendered.ends_with("plain message with no creds"));
 }
 
 #[test]
@@ -553,15 +708,20 @@ Expected: FAIL — `duckx::error` does not exist.
 
 - [ ] **Step 3: Implement `error.rs`**
 
+Add to `Cargo.toml` `[dependencies]`: `regex = "1"`, and `once_cell = "1"`.
+
 Write `src/error.rs`:
 
 ```rust
 //! `DuckxError`: typed errors with PII-safe `Display`.
 //!
-//! Passwords are wrapped in `secrecy::SecretString` upstream; this enum's
-//! `RedshiftError` variant scrubs anything matching `password=...` or
-//! `pwd=...` before rendering.
+//! `RedshiftError` strings are scrubbed for two leak patterns before
+//! rendering:
+//!   1. keyword form: `(?i)(password|pwd)=<value-up-to-delim>`
+//!   2. URL form:     `(?i)(postgres|postgresql)://user:<password>@`
 
+use once_cell::sync::Lazy;
+use regex::Regex;
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -585,48 +745,19 @@ pub enum DuckxError {
     BatchDecode(String),
 }
 
+static KEYWORD_PW: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"(?i)\b(password|pwd)\s*=\s*[^\s,;)]*").unwrap());
+static URL_PW: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r"(?i)(postgres(?:ql)?)://([^:/@\s]+):([^@\s]+)@").unwrap()
+});
+
 fn redact(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    let lower = s.to_ascii_lowercase();
-    let mut i = 0usize;
-    while i < s.len() {
-        let rest = &lower[i..];
-        if let Some(start) = ["password=", "pwd="].iter().find_map(|tag| rest.find(tag)) {
-            out.push_str(&s[i..i + start]);
-            // pick the matching tag length
-            let tag_len = if rest[start..].starts_with("password=") { 9 } else { 4 };
-            out.push_str(&s[i + start..i + start + tag_len]);
-            out.push_str("****");
-            // skip past the redacted value (until whitespace / `,` / `)` / end)
-            let after = i + start + tag_len;
-            let end = s[after..]
-                .find(|c: char| c.is_whitespace() || c == ',' || c == ')' || c == ';')
-                .map(|n| after + n)
-                .unwrap_or(s.len());
-            i = end;
-        } else {
-            out.push_str(&s[i..]);
-            break;
-        }
-    }
-    out
+    let s = KEYWORD_PW.replace_all(s, |c: &regex::Captures| format!("{}=****", &c[1]));
+    let s = URL_PW.replace_all(&s, |c: &regex::Captures| {
+        format!("{scheme}://{user}:****@", scheme = &c[1], user = &c[2])
+    });
+    s.into_owned()
 }
-
-#[cfg(test)]
-impl secrecy::ExposeSecret<str> for secrecy::SecretString {
-    // (already provided by `secrecy`; this comment is here to remind callers
-    // not to re-export `expose_secret_for_test_only`.)
-}
-```
-
-> **Note:** `secrecy::SecretString::expose_secret_for_test_only` is not a real API; the test above uses `expose_secret()` from the `ExposeSecret` trait. Replace with the actual trait method when implementing.
-
-Corrected test step (replace `expose_secret_for_test_only()` with `expose_secret()`):
-
-```rust
-use secrecy::ExposeSecret;
-let leak = secret.expose_secret();
-let err = DuckxError::RedshiftError(format!("password={leak}"));
 ```
 
 - [ ] **Step 4: Wire into `lib.rs`**
@@ -670,79 +801,107 @@ git commit -m "feat(error): typed errors with password redaction in Display"
 Write `tests/unit/config_resolve.rs`:
 
 ```rust
-use duckx::config::{resolve_from_env, Config};
+use duckx::config::{resolve_from_env, Config, SslMode};
 use duckx::error::DuckxError;
+use serial_test::serial;
 
-fn env_quad() -> Vec<(&'static str, &'static str)> {
+fn env_full() -> Vec<(&'static str, &'static str)> {
     vec![
         ("REDSHIFT_HOST", "db.aws"),
         ("REDSHIFT_PORT", "5439"),
         ("REDSHIFT_USER", "analyst"),
         ("REDSHIFT_PASSWORD", "hunter2"),
         ("REDSHIFT_DATABASE", "analytics"),
+        ("REDSHIFT_SSLMODE", "require"),
     ]
 }
 
-fn with_env<F: FnOnce()>(vars: &[(&'static str, &'static str)], f: F) {
-    let prev: Vec<_> = vars.iter().map(|(k, _)| (*k, std::env::var(k).ok())).collect();
+fn clear_env() {
+    for k in [
+        "REDSHIFT_HOST","REDSHIFT_PORT","REDSHIFT_USER",
+        "REDSHIFT_PASSWORD","REDSHIFT_DATABASE","REDSHIFT_SSLMODE",
+    ] { std::env::remove_var(k); }
+}
+
+fn set_env(vars: &[(&'static str, &'static str)]) {
+    clear_env();
     for (k, v) in vars { std::env::set_var(k, v); }
-    let _guard = scopeguard::guard((), |_| {
-        for (k, v) in prev {
-            match v { Some(val) => std::env::set_var(k, val), None => std::env::remove_var(k) }
-        }
-    });
-    f();
 }
 
 #[test]
+#[serial]
 fn full_env_resolves() {
-    with_env(&env_quad(), || {
-        let cfg = resolve_from_env().expect("ok");
-        assert_eq!(cfg.host, "db.aws");
-        assert_eq!(cfg.port, 5439);
-        assert_eq!(cfg.user, "analyst");
-        assert_eq!(cfg.database, "analytics");
-    });
+    set_env(&env_full());
+    let cfg = resolve_from_env().expect("ok");
+    assert_eq!(cfg.host, "db.aws");
+    assert_eq!(cfg.port, 5439);
+    assert_eq!(cfg.user, "analyst");
+    assert_eq!(cfg.database, "analytics");
+    assert_eq!(cfg.sslmode, SslMode::Require);
 }
 
 #[test]
+#[serial]
 fn port_defaults_to_5439_when_unset() {
-    let mut e = env_quad();
-    e.retain(|(k, _)| *k != "REDSHIFT_PORT");
-    with_env(&e, || {
-        let cfg = resolve_from_env().expect("ok");
-        assert_eq!(cfg.port, 5439);
-    });
+    let mut e = env_full(); e.retain(|(k, _)| *k != "REDSHIFT_PORT");
+    set_env(&e);
+    let cfg = resolve_from_env().expect("ok");
+    assert_eq!(cfg.port, 5439);
 }
 
 #[test]
+#[serial]
+fn sslmode_defaults_to_require_when_unset() {
+    let mut e = env_full(); e.retain(|(k, _)| *k != "REDSHIFT_SSLMODE");
+    set_env(&e);
+    let cfg = resolve_from_env().expect("ok");
+    assert_eq!(cfg.sslmode, SslMode::Require);
+}
+
+#[test]
+#[serial]
+fn sslmode_disable_is_accepted() {
+    let mut e = env_full();
+    for (k, v) in e.iter_mut() { if *k == "REDSHIFT_SSLMODE" { *v = "disable"; } }
+    set_env(&e);
+    let cfg = resolve_from_env().expect("ok");
+    assert_eq!(cfg.sslmode, SslMode::Disable);
+}
+
+#[test]
+#[serial]
+fn sslmode_invalid_errors() {
+    let mut e = env_full();
+    for (k, v) in e.iter_mut() { if *k == "REDSHIFT_SSLMODE" { *v = "yolo"; } }
+    set_env(&e);
+    assert!(matches!(resolve_from_env(), Err(DuckxError::BadDsn(_))));
+}
+
+#[test]
+#[serial]
 fn missing_fields_listed_explicitly() {
-    let e = vec![("REDSHIFT_HOST", "db.aws")];
-    with_env(&e, || {
-        match resolve_from_env() {
-            Err(DuckxError::MissingCredential { fields }) => {
-                for f in ["user", "password", "database"] {
-                    assert!(fields.iter().any(|x| x == f), "missing {f}: {fields:?}");
-                }
+    set_env(&[("REDSHIFT_HOST", "db.aws")]);
+    match resolve_from_env() {
+        Err(DuckxError::MissingCredential { fields }) => {
+            for f in ["user", "password", "database"] {
+                assert!(fields.iter().any(|x| x == f), "missing {f}: {fields:?}");
             }
-            other => panic!("expected MissingCredential, got {other:?}"),
         }
-    });
+        other => panic!("expected MissingCredential, got {other:?}"),
+    }
 }
 
 #[test]
+#[serial]
 fn invalid_port_errors() {
-    let mut e = env_quad();
-    for (k, v) in e.iter_mut() {
-        if *k == "REDSHIFT_PORT" { *v = "not-a-number"; }
-    }
-    with_env(&e, || {
-        assert!(matches!(resolve_from_env(), Err(DuckxError::BadDsn(_))));
-    });
+    let mut e = env_full();
+    for (k, v) in e.iter_mut() { if *k == "REDSHIFT_PORT" { *v = "not-a-number"; } }
+    set_env(&e);
+    assert!(matches!(resolve_from_env(), Err(DuckxError::BadDsn(_))));
 }
 ```
 
-> **Note:** add `scopeguard = "1"` to `[dev-dependencies]` in `Cargo.toml`.
+> **Note:** add `serial_test = "3"` to `[dev-dependencies]`. All env-var manipulation tests are marked `#[serial]` to prevent races across the cargo-test thread pool.
 
 - [ ] **Step 2: Run tests — expect failure**
 
@@ -760,10 +919,44 @@ Write `src/config.rs`:
 //! This module intentionally knows nothing about DuckDB or connectorx.
 //! It produces a [`Config`] from environment variables (or, in `secret.rs`,
 //! from a DuckDB Secret). All callers go through [`Config::to_postgres_dsn`]
-//! to get a connection string.
+//! to get an internal connection string.
 
 use crate::error::DuckxError;
 use secrecy::{ExposeSecret, SecretString};
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SslMode {
+    Disable,
+    Prefer,
+    Require,
+    VerifyCa,
+    VerifyFull,
+}
+
+impl SslMode {
+    pub fn parse(s: &str) -> Result<Self, DuckxError> {
+        match s.to_ascii_lowercase().as_str() {
+            "disable"     => Ok(Self::Disable),
+            "prefer"      => Ok(Self::Prefer),
+            "require"     => Ok(Self::Require),
+            "verify-ca"   => Ok(Self::VerifyCa),
+            "verify-full" => Ok(Self::VerifyFull),
+            other => Err(DuckxError::BadDsn(format!(
+                "invalid sslmode {other:?}; expected one of: disable, prefer, require, verify-ca, verify-full"
+            ))),
+        }
+    }
+
+    pub fn as_libpq_str(&self) -> &'static str {
+        match self {
+            Self::Disable => "disable",
+            Self::Prefer => "prefer",
+            Self::Require => "require",
+            Self::VerifyCa => "verify-ca",
+            Self::VerifyFull => "verify-full",
+        }
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -772,21 +965,41 @@ pub struct Config {
     pub user: String,
     pub password: SecretString,
     pub database: String,
+    pub sslmode: SslMode,
 }
 
 impl Config {
-    /// Build a libpq-style DSN. The password is URL-encoded so embedded
-    /// special characters do not break parsing downstream.
+    /// Build a libpq-style DSN. Internal use only. Callers must NOT log this.
+    /// The password is URL-encoded; `sslmode` is emitted as a query parameter.
     pub fn to_postgres_dsn(&self) -> String {
         let pw = url::form_urlencoded::byte_serialize(self.password.expose_secret().as_bytes())
             .collect::<String>();
         let user = url::form_urlencoded::byte_serialize(self.user.as_bytes()).collect::<String>();
         format!(
-            "postgresql://{user}:{pw}@{host}:{port}/{db}",
+            "postgresql://{user}:{pw}@{host}:{port}/{db}?sslmode={ssl}",
             host = self.host,
             port = self.port,
             db = self.database,
+            ssl = self.sslmode.as_libpq_str(),
         )
+    }
+}
+
+/// Validate that an identifier (e.g. partition column name) is safe to
+/// interpolate into SQL. Matches `^[A-Za-z_][A-Za-z0-9_]*$` and bounds length.
+pub fn validate_identifier(name: &str) -> Result<(), DuckxError> {
+    let valid = !name.is_empty()
+        && name.len() <= 128
+        && name.chars().enumerate().all(|(i, c)| {
+            if i == 0 { c.is_ascii_alphabetic() || c == '_' }
+            else      { c.is_ascii_alphanumeric() || c == '_' }
+        });
+    if valid {
+        Ok(())
+    } else {
+        Err(DuckxError::BadDsn(format!(
+            "identifier {name:?} must match ^[A-Za-z_][A-Za-z0-9_]*$ (max 128 chars)"
+        )))
     }
 }
 
@@ -796,6 +1009,7 @@ pub fn resolve_from_env() -> Result<Config, DuckxError> {
     let user = std::env::var("REDSHIFT_USER").ok();
     let password = std::env::var("REDSHIFT_PASSWORD").ok();
     let database = std::env::var("REDSHIFT_DATABASE").ok();
+    let sslmode_raw = std::env::var("REDSHIFT_SSLMODE").ok();
 
     let mut missing = Vec::new();
     if host.is_none() { missing.push("host".into()); }
@@ -814,12 +1028,22 @@ pub fn resolve_from_env() -> Result<Config, DuckxError> {
         None => 5439,
     };
 
+    let sslmode = match sslmode_raw.as_deref() {
+        Some(s) => SslMode::parse(s)?,
+        None => SslMode::Require,
+    };
+
+    if matches!(sslmode, SslMode::Disable) {
+        tracing::warn!(target: "duckx", "REDSHIFT_SSLMODE=disable — plaintext connection to Redshift is not recommended");
+    }
+
     Ok(Config {
         host: host.unwrap(),
         port,
         user: user.unwrap(),
         password: SecretString::new(password.unwrap().into()),
         database: database.unwrap(),
+        sslmode,
     })
 }
 ```
@@ -845,33 +1069,42 @@ git commit -m "feat(config): credential resolution from env vars with explicit m
 
 ## Task 6: Secret type registration — `secret.rs`
 
-> Runs in parallel with Tasks 5, 7, 8.
+> Runs in parallel with Tasks 5, 7, 8. **Blocked by Task 2.5** — read `spikes/secrets_api/README.md` first; the chosen path (safe Rust API vs FFI vs hybrid) and the field-read mechanism are determined there.
 
 **Files:**
 - Create: `src/secret.rs`
 - Create: `tests/unit/secret_lookup.rs`
 - Modify: `src/lib.rs` — add `pub mod secret;`
 
-**Important:** `duckdb-rs` may or may not expose the Secrets Manager directly. If it doesn't yet, this task must drop down to the `duckdb-extension-framework` C-API helpers and call `duckdb_secrets_*` FFI symbols directly. Verify which path is available **before** writing tests.
+The `duckdb_secrets()` SQL view does NOT expose individual field values as columns. Lookup must use the API discovered in Task 2.5 (typically: register a secret type, then read fields via the secret-handle C API). Do not write SQL like `SELECT host, port, ... FROM duckdb_secrets()` — that schema does not exist.
 
-- [ ] **Step 1: Probe `duckdb-rs` for Secret APIs**
+- [ ] **Step 1: Read Task 2.5's findings**
 
-Run: `cargo doc -p duckdb --open` and search for `Secret`. Record findings in a comment at the top of `src/secret.rs`.
+Open `spikes/secrets_api/README.md`. Confirm:
+
+- The exact registration function (safe Rust or FFI symbol).
+- The field-read mechanism returning string values for each named field of a secret instance.
+- Any version-specific quirks recorded.
+
+If Task 2.5 has not run, run it first.
 
 - [ ] **Step 2: Write the lookup test**
 
 Write `tests/unit/secret_lookup.rs`:
 
 ```rust
-//! These tests construct a DuckDB connection in-process, register the
-//! REDSHIFT secret type, CREATE SECRET, and verify our lookup returns a
-//! Config with the expected fields.
+//! Constructs a DuckDB connection in-process, registers the REDSHIFT
+//! secret type, CREATE SECRET, and verifies our lookup returns a Config
+//! with every expected field.
 
 use duckdb::Connection;
-use duckx::config::Config;
+use duckx::config::{Config, SslMode};
 use duckx::secret::{lookup_secret, register_redshift_secret_type};
+use secrecy::ExposeSecret;
+use serial_test::serial;
 
 #[test]
+#[serial]
 fn create_and_lookup_secret_round_trip() {
     let conn = Connection::open_in_memory().unwrap();
     register_redshift_secret_type(&conn).unwrap();
@@ -879,10 +1112,11 @@ fn create_and_lookup_secret_round_trip() {
         "CREATE SECRET test_secret (
             TYPE REDSHIFT,
             HOST 'db.aws',
-            PORT 5439,
+            PORT '5439',
             USER 'analyst',
             PASSWORD 'hunter2',
-            DATABASE 'analytics'
+            DATABASE 'analytics',
+            SSLMODE 'require'
         );",
     )
     .unwrap();
@@ -892,9 +1126,25 @@ fn create_and_lookup_secret_round_trip() {
     assert_eq!(cfg.port, 5439);
     assert_eq!(cfg.user, "analyst");
     assert_eq!(cfg.database, "analytics");
+    assert_eq!(cfg.password.expose_secret(), "hunter2");
+    assert_eq!(cfg.sslmode, SslMode::Require);
 }
 
 #[test]
+#[serial]
+fn sslmode_defaults_to_require_when_field_omitted() {
+    let conn = Connection::open_in_memory().unwrap();
+    register_redshift_secret_type(&conn).unwrap();
+    conn.execute_batch(
+        "CREATE SECRET s (TYPE REDSHIFT,
+            HOST 'h', PORT '5439', USER 'u', PASSWORD 'p', DATABASE 'd');",
+    ).unwrap();
+    let cfg = lookup_secret(&conn, "s").unwrap();
+    assert_eq!(cfg.sslmode, SslMode::Require);
+}
+
+#[test]
+#[serial]
 fn missing_secret_errors() {
     let conn = Connection::open_in_memory().unwrap();
     register_redshift_secret_type(&conn).unwrap();
@@ -905,81 +1155,88 @@ fn missing_secret_errors() {
 
 - [ ] **Step 3: Run tests — expect failure**
 
-Run: `cargo test --test secret_lookup`
+Run: `cargo test --test secret_lookup -- --test-threads=1`
 
 Expected: FAIL — module does not exist.
 
 - [ ] **Step 4: Implement `secret.rs`**
 
-Write `src/secret.rs`:
+Skeleton — fill in `register_redshift_secret_type` and `lookup_secret` bodies using the exact API path recorded in `spikes/secrets_api/README.md`. Do not invent API symbols — copy from the spike.
 
 ```rust
 //! DuckDB Secrets Manager integration for `TYPE REDSHIFT`.
 //!
-//! At time of writing, `duckdb-rs` exposes Secrets via the FFI surface in
-//! `duckdb::ffi`. This module wraps the four FFI entry points we need:
-//! - register a secret type with named string fields
-//! - look up a secret by name and read its fields back as strings
-//!
-//! The implementation deliberately allocates owned `String`s on lookup so
-//! callers cannot accidentally hold a pointer past secret rotation.
+//! Implementation strategy is defined in `spikes/secrets_api/README.md`
+//! (Task 2.5). Field-read uses whichever C-API or Rust-API path that
+//! spike validated. Owned `String`s are returned so callers cannot hold
+//! a pointer past secret rotation.
 
-use crate::config::Config;
+use crate::config::{Config, SslMode};
 use crate::error::DuckxError;
 use duckdb::Connection;
 use secrecy::SecretString;
 
-const FIELDS: &[&str] = &["host", "port", "user", "password", "database"];
+pub const SECRET_FIELDS: &[&str] = &["host", "port", "user", "password", "database", "sslmode"];
 
 pub fn register_redshift_secret_type(conn: &Connection) -> Result<(), DuckxError> {
-    // Implementation note: duckdb-rs API for secret registration is in flux.
-    // Use whichever of the following is available in the pinned version:
-    //   - `Connection::register_secret_type` (preferred, when present)
-    //   - direct FFI via `duckdb::ffi::duckdb_secret_type` (fallback)
+    // PASTE the exact body from spikes/secrets_api/src/main.rs's
+    // `register_redshift_test_secret`, adjusted to register the type name
+    // "REDSHIFT" (not "REDSHIFT_TEST") with the SECRET_FIELDS above.
     //
-    // The fallback path is documented in DuckDB's C API extension docs:
-    //   https://duckdb.org/docs/extensions/overview#secret-types
-    //
-    // Either way: register a secret type named "REDSHIFT" with the FIELDS
-    // listed above; values are stored as VARCHAR.
-    let _ = (conn, FIELDS);
-    todo!("fill in once the duckdb-rs API surface is confirmed in Step 1")
+    // Wrap any duckdb / ffi error in DuckxError::RedshiftError.
+    todo!("paste from spikes/secrets_api after Task 2.5 confirms the path")
 }
 
 pub fn lookup_secret(conn: &Connection, name: &str) -> Result<Config, DuckxError> {
-    let mut row = conn
-        .query_row(
-            "SELECT host, port, user, password, database
-               FROM duckdb_secrets()
-              WHERE name = ?
-                AND type = 'REDSHIFT'",
-            [name],
-            |r| Ok((
-                r.get::<_, String>(0)?,
-                r.get::<_, i64>(1)?,
-                r.get::<_, String>(2)?,
-                r.get::<_, String>(3)?,
-                r.get::<_, String>(4)?,
-            )),
-        )
-        .map_err(|e| DuckxError::RedshiftError(format!("secret lookup failed: {e}")))?;
+    let fields = read_secret_fields(conn, name)?;
 
-    let port: u16 = row
-        .1
-        .try_into()
-        .map_err(|_| DuckxError::BadDsn(format!("port out of range: {}", row.1)))?;
+    let host = take_field(&fields, "host")?;
+    let user = take_field(&fields, "user")?;
+    let password = take_field(&fields, "password")?;
+    let database = take_field(&fields, "database")?;
+
+    let port: u16 = match fields.get("port") {
+        Some(s) => s.parse().map_err(|_| {
+            DuckxError::BadDsn(format!("secret {name:?}: port {s:?} is not a valid u16"))
+        })?,
+        None => 5439,
+    };
+    let sslmode = match fields.get("sslmode") {
+        Some(s) => SslMode::parse(s)?,
+        None => SslMode::Require,
+    };
 
     Ok(Config {
-        host: std::mem::take(&mut row.0),
+        host,
         port,
-        user: std::mem::take(&mut row.2),
-        password: SecretString::new(std::mem::take(&mut row.3).into()),
-        database: std::mem::take(&mut row.4),
+        user,
+        password: SecretString::new(password.into()),
+        database,
+        sslmode,
+    })
+}
+
+fn read_secret_fields(
+    conn: &Connection,
+    name: &str,
+) -> Result<std::collections::BTreeMap<String, String>, DuckxError> {
+    // PASTE the exact body from spikes/secrets_api/src/main.rs's
+    // `read_secret_fields` (or equivalent), error-wrapped.
+    let _ = (conn, name);
+    todo!("paste from spikes/secrets_api after Task 2.5 confirms the path")
+}
+
+fn take_field(
+    fields: &std::collections::BTreeMap<String, String>,
+    name: &str,
+) -> Result<String, DuckxError> {
+    fields.get(name).cloned().ok_or_else(|| DuckxError::MissingCredential {
+        fields: vec![name.into()],
     })
 }
 ```
 
-> The `register_redshift_secret_type` body MUST NOT remain a `todo!()` — implement it via the path identified in Step 1 before running tests.
+> The two `todo!()` calls in this file are placeholders for code that comes verbatim from Task 2.5's spike. They MUST be replaced — the test gate at Step 6 will catch it if not.
 
 - [ ] **Step 5: Wire into `lib.rs`**
 
@@ -987,9 +1244,9 @@ Add `pub mod secret;` to `src/lib.rs`.
 
 - [ ] **Step 6: Run tests — expect pass**
 
-Run: `cargo test --test secret_lookup`
+Run: `cargo test --test secret_lookup -- --test-threads=1`
 
-Expected: PASS.
+Expected: PASS, all three tests. If they fail with `not yet implemented`, the `todo!()` placeholders weren't replaced — go back to Step 4.
 
 - [ ] **Step 7: Commit**
 
@@ -1027,6 +1284,7 @@ fn supported_scalar_types_map_correctly() {
         (ArrowDt::Int16,                         LogicalTypeId::Smallint),
         (ArrowDt::Int32,                         LogicalTypeId::Integer),
         (ArrowDt::Int64,                         LogicalTypeId::Bigint),
+        (ArrowDt::UInt64,                        LogicalTypeId::Hugeint),
         (ArrowDt::Float32,                       LogicalTypeId::Float),
         (ArrowDt::Float64,                       LogicalTypeId::Double),
         (ArrowDt::Utf8,                          LogicalTypeId::Varchar),
@@ -1045,7 +1303,7 @@ fn supported_scalar_types_map_correctly() {
 }
 
 #[test]
-fn unsupported_arrow_types_error_with_column_name() {
+fn unsupported_list_errors_with_column_name() {
     let arrow_ty = ArrowDt::List(std::sync::Arc::new(arrow::datatypes::Field::new(
         "x", ArrowDt::Int32, true,
     )));
@@ -1056,6 +1314,48 @@ fn unsupported_arrow_types_error_with_column_name() {
             assert!(type_name.contains("List"));
         }
         other => panic!("expected UnsupportedType, got {other:?}"),
+    }
+}
+
+#[test]
+fn other_unsupported_arrow_types_error() {
+    use std::sync::Arc;
+    let cases: &[(ArrowDt, &str)] = &[
+        (
+            ArrowDt::Struct(arrow::datatypes::Fields::from(vec![
+                arrow::datatypes::Field::new("a", ArrowDt::Int32, true),
+            ])),
+            "Struct",
+        ),
+        (
+            ArrowDt::Map(
+                Arc::new(arrow::datatypes::Field::new(
+                    "entries",
+                    ArrowDt::Struct(arrow::datatypes::Fields::from(vec![
+                        arrow::datatypes::Field::new("key", ArrowDt::Utf8, false),
+                        arrow::datatypes::Field::new("value", ArrowDt::Int32, true),
+                    ])),
+                    false,
+                )),
+                false,
+            ),
+            "Map",
+        ),
+        (ArrowDt::Interval(arrow::datatypes::IntervalUnit::DayTime), "Interval"),
+        (ArrowDt::Duration(TimeUnit::Microsecond), "Duration"),
+    ];
+    for (arrow_ty, expected_substr) in cases {
+        let err = arrow_to_duckdb("c", arrow_ty).expect_err("must error");
+        match err {
+            DuckxError::UnsupportedType { column, type_name } => {
+                assert_eq!(column, "c");
+                assert!(
+                    type_name.contains(expected_substr),
+                    "type_name {type_name:?} missing substring {expected_substr:?}"
+                );
+            }
+            other => panic!("expected UnsupportedType, got {other:?}"),
+        }
     }
 }
 ```
@@ -1082,6 +1382,10 @@ use arrow::datatypes::{DataType, TimeUnit};
 use duckdb::core::{LogicalTypeHandle, LogicalTypeId};
 
 pub fn arrow_to_duckdb(column: &str, t: &DataType) -> Result<LogicalTypeHandle, DuckxError> {
+    // Decimal needs precision/scale; handle it before the simple branch.
+    if let DataType::Decimal128(p, s) | DataType::Decimal256(p, s) = t {
+        return Ok(LogicalTypeHandle::decimal(*p, *s as u8));
+    }
     let id = match t {
         DataType::Boolean => LogicalTypeId::Boolean,
         DataType::Int8 | DataType::Int16 => LogicalTypeId::Smallint,
@@ -1098,7 +1402,12 @@ pub fn arrow_to_duckdb(column: &str, t: &DataType) -> Result<LogicalTypeHandle, 
         DataType::Time32(_) | DataType::Time64(_) => LogicalTypeId::Time,
         DataType::Timestamp(_, None) => LogicalTypeId::Timestamp,
         DataType::Timestamp(_, Some(_)) => LogicalTypeId::TimestampTz,
-        DataType::Decimal128(_, _) | DataType::Decimal256(_, _) => LogicalTypeId::Decimal,
+        // Best-effort fallthrough — any Arrow type not enumerated above
+        // (Interval, Duration, List, Struct, Map, Union, Float16, etc.)
+        // surfaces an UnsupportedType with the column name and Arrow type
+        // string. Spec lists the known Redshift types this catches:
+        // SUPER, GEOMETRY/GEOGRAPHY, HLLSKETCH, VARBYTE, INTERVAL,
+        // TIME WITH TIME ZONE, OID.
         other => {
             return Err(DuckxError::UnsupportedType {
                 column: column.to_string(),
@@ -1107,10 +1416,6 @@ pub fn arrow_to_duckdb(column: &str, t: &DataType) -> Result<LogicalTypeHandle, 
         }
     };
 
-    // Decimal needs precision/scale; everything else is a plain logical type.
-    if let DataType::Decimal128(p, s) | DataType::Decimal256(p, s) = t {
-        return Ok(LogicalTypeHandle::decimal(*p, *s as u8));
-    }
     let _ = TimeUnit::Microsecond; // silence unused import on some duckdb-rs versions
     Ok(LogicalTypeHandle::from(id))
 }
@@ -1159,6 +1464,16 @@ fn no_partitioning_returns_single() {
 }
 
 #[test]
+fn partition_num_one_is_single_even_with_partition_on() {
+    let args = PartitionArgs {
+        partition_on: Some("id".into()),
+        partition_num: Some(1),
+        ..Default::default()
+    };
+    assert!(matches!(validate(&args), Ok(PartitionSpec::Single)));
+}
+
+#[test]
 fn partition_num_without_on_errors() {
     let args = PartitionArgs { partition_num: Some(8), ..Default::default() };
     assert!(matches!(validate(&args), Err(DuckxError::PartitionBoundsInvalid { .. })));
@@ -1174,6 +1489,16 @@ fn partition_on_without_num_defaults_to_4() {
         }
         _ => panic!("expected Parallel"),
     }
+}
+
+#[test]
+fn invalid_identifier_errors() {
+    let args = PartitionArgs {
+        partition_on: Some("id; DROP TABLE t".into()),
+        partition_num: Some(4),
+        ..Default::default()
+    };
+    assert!(matches!(validate(&args), Err(DuckxError::BadDsn(_))));
 }
 
 #[test]
@@ -1243,16 +1568,22 @@ pub enum PartitionSpec {
 pub fn validate(args: &PartitionArgs) -> Result<PartitionSpec, DuckxError> {
     match (&args.partition_on, args.partition_num) {
         (None, None) => Ok(PartitionSpec::Single),
+        (None, Some(n)) if n == 1 => Ok(PartitionSpec::Single),
         (None, Some(_)) => Err(DuckxError::PartitionBoundsInvalid {
             reason: "partition_num requires partition_on",
         }),
         (Some(col), maybe_num) => {
+            // partition_on with partition_num=1 (or unspecified=1) → Single.
             let num = maybe_num.unwrap_or(4);
+            if num == 1 {
+                return Ok(PartitionSpec::Single);
+            }
             if !(2..=64).contains(&num) {
                 return Err(DuckxError::PartitionBoundsInvalid {
-                    reason: "partition_num must be between 2 and 64",
+                    reason: "partition_num must be between 1 and 64",
                 });
             }
+            crate::config::validate_identifier(col)?;
             let bounds = match (args.partition_min, args.partition_max) {
                 (None, None) => None,
                 (Some(lo), Some(hi)) if lo <= hi => Some((lo, hi)),
@@ -1310,9 +1641,9 @@ Write `tests/integration_pg/pipeline_smoke.rs`:
 //! end-to-end without DuckDB in the loop.
 
 use arrow::array::Int32Array;
-use duckx::config::Config;
+use duckx::config::{Config, SslMode};
 use duckx::partition::PartitionSpec;
-use duckx::pipeline::run_pipeline;
+use duckx::pipeline::{discover_bounds, run_pipeline};
 use secrecy::SecretString;
 use testcontainers::runners::SyncRunner;
 use testcontainers_modules::postgres::Postgres;
@@ -1326,6 +1657,7 @@ fn seeded_pg() -> (testcontainers::Container<Postgres>, Config) {
         user: "postgres".into(),
         password: SecretString::new("postgres".to_string().into()),
         database: "postgres".into(),
+        sslmode: SslMode::Disable, // testcontainers Postgres has no TLS
     };
     let conn_str = cfg.to_postgres_dsn();
     let mut client = postgres::Client::connect(&conn_str, postgres::NoTls).unwrap();
@@ -1366,8 +1698,11 @@ fn partitioned_scan_returns_same_multiset() {
         .collect();
     let mut unp_sorted = unp.clone(); unp_sorted.sort();
 
+    // Exercise discover_bounds explicitly (matches scan.rs::init flow).
+    let (lo, hi) = discover_bounds(&cfg, "SELECT id FROM t", "id").unwrap();
+    assert_eq!((lo, hi), (1, 100));
     let spec = PartitionSpec::Parallel {
-        column: "id".into(), num: 4, bounds: Some((1, 100)),
+        column: "id".into(), num: 4, bounds: Some((lo, hi)),
     };
     let part: Vec<i32> = run_pipeline(&cfg, "SELECT id FROM t", &spec)
         .unwrap()
@@ -1398,12 +1733,15 @@ Write `src/pipeline.rs`:
 //! connectorx → Arrow streaming pipeline.
 //!
 //! `run_pipeline` returns an iterator of `arrow::record_batch::RecordBatch`.
-//! It is deliberately ignorant of DuckDB; the only consumer is `scan.rs`.
+//! Deliberately ignorant of DuckDB; only consumer is `scan.rs`.
 //!
-//! Bound discovery for partitioned scans (when `bounds = None`) issues a
-//! `SELECT MIN(col), MAX(col) FROM (<query>) t` against the same connection.
+//! Bound discovery for partitioned scans is a SEPARATE function
+//! (`discover_bounds`) called from `scan.rs::init` exactly once per scan
+//! when `PartitionSpec::Parallel { bounds: None }`. It is intentionally
+//! NOT called inside `run_pipeline` so the schema-probe path (also calling
+//! `run_pipeline` with `Single`) does not double-execute MIN/MAX queries.
 
-use crate::config::Config;
+use crate::config::{validate_identifier, Config, SslMode};
 use crate::error::DuckxError;
 use crate::partition::PartitionSpec;
 use arrow::record_batch::RecordBatch;
@@ -1417,18 +1755,21 @@ pub fn run_pipeline(
     user_query: &str,
     spec: &PartitionSpec,
 ) -> Result<Box<dyn Iterator<Item = Result<RecordBatch, DuckxError>>>, DuckxError> {
-    let dsn = cfg.to_postgres_dsn();
     let queries = match spec {
         PartitionSpec::Single => vec![CXQuery::naked(user_query)],
         PartitionSpec::Parallel { column, num, bounds } => {
-            let (lo, hi) = match bounds {
-                Some(b) => *b,
-                None => discover_bounds(&dsn, user_query, column)?,
-            };
+            // bounds MUST be Some here. Callers must run `discover_bounds`
+            // and pass an explicit `Parallel { bounds: Some(_) }` spec to
+            // run_pipeline. If we get None here, that's a caller bug.
+            let (lo, hi) = bounds.ok_or_else(|| DuckxError::PartitionBoundsInvalid {
+                reason: "internal: run_pipeline called with Parallel { bounds: None } — call discover_bounds first",
+            })?;
+            validate_identifier(column)?;
             partition_queries(user_query, column, *num, lo, hi)
         }
     };
 
+    let dsn = cfg.to_postgres_dsn();
     let (cfg_url, _tls) = rewrite_tls_args(&url::Url::parse(&dsn).unwrap())
         .map_err(|e| DuckxError::BadDsn(e.to_string()))?;
     let source = PostgresSource::<BinaryProtocol, _>::new(cfg_url, queries.len())
@@ -1447,14 +1788,32 @@ pub fn run_pipeline(
     Ok(Box::new(batches.into_iter().map(Ok)))
 }
 
-fn discover_bounds(dsn: &str, query: &str, column: &str) -> Result<(i64, i64), DuckxError> {
-    let mut client = postgres::Client::connect(dsn, postgres::NoTls)
-        .map_err(|e| DuckxError::RedshiftError(e.to_string()))?;
+/// Run a `MIN/MAX` round-trip on `column` over `user_query`. Called once
+/// from `scan.rs::init` when `PartitionSpec::Parallel { bounds: None }`.
+/// Honors `cfg.sslmode` via the `tokio-postgres` / `postgres-native-tls` stack.
+pub fn discover_bounds(
+    cfg: &Config,
+    user_query: &str,
+    column: &str,
+) -> Result<(i64, i64), DuckxError> {
+    validate_identifier(column)?;
+    let dsn = cfg.to_postgres_dsn();
+    let mut client = match cfg.sslmode {
+        SslMode::Disable => postgres::Client::connect(&dsn, postgres::NoTls)
+            .map_err(|e| DuckxError::RedshiftError(e.to_string()))?,
+        _ => {
+            let connector = native_tls::TlsConnector::new()
+                .map_err(|e| DuckxError::RedshiftError(format!("tls init: {e}")))?;
+            let tls = postgres_native_tls::MakeTlsConnector::new(connector);
+            postgres::Client::connect(&dsn, tls)
+                .map_err(|e| DuckxError::RedshiftError(e.to_string()))?
+        }
+    };
+    let sql = format!(
+        "SELECT MIN(\"{column}\"), MAX(\"{column}\") FROM ({user_query}) AS __duckx_bounds"
+    );
     let row = client
-        .query_one(
-            &format!("SELECT MIN({column}), MAX({column}) FROM ({query}) AS __duckx_bounds"),
-            &[],
-        )
+        .query_one(&sql, &[])
         .map_err(|e| DuckxError::RedshiftError(e.to_string()))?;
     let lo: i64 = row.get(0);
     let hi: i64 = row.get(1);
@@ -1468,15 +1827,19 @@ fn partition_queries(query: &str, column: &str, num: u32, lo: i64, hi: i64) -> V
         .map(|i| {
             let start = lo + i * chunk;
             let end = (start + chunk - 1).min(hi);
+            // Column was identifier-validated above; double-quote for safe
+            // mixed-case identifier handling.
             CXQuery::naked(format!(
-                "SELECT * FROM ({query}) AS __duckx_part WHERE {column} BETWEEN {start} AND {end}"
+                "SELECT * FROM ({query}) AS __duckx_part WHERE \"{column}\" BETWEEN {start} AND {end}"
             ))
         })
         .collect()
 }
 ```
 
-> Note on the dispatcher: connectorx's API has shifted across versions. The exact import paths above target connectorx 0.4. If a newer version restructures `prelude::Dispatcher`, follow its `examples/postgres_to_arrow.rs` and update accordingly. Do not invent new APIs.
+> Add `native-tls = "0.2"` and `postgres-native-tls = "0.5"` to `[dependencies]` for the TLS path.
+>
+> Note on the dispatcher: connectorx's API has shifted across versions. The import paths above target connectorx 0.4. If a newer version restructures `prelude::Dispatcher`, follow its `examples/postgres_to_arrow.rs` and update accordingly — do not invent APIs.
 
 - [ ] **Step 4: Wire into `lib.rs`**
 
@@ -1523,26 +1886,34 @@ use duckx::scan::parse_named_args;
 #[test]
 fn parses_supported_named_args() {
     let pairs = vec![
-        ("secret".to_string(),       "prod".to_string()),
-        ("partition_on".to_string(), "id".to_string()),
-        ("partition_num".to_string(),"8".to_string()),
-        ("partition_min".to_string(),"0".to_string()),
-        ("partition_max".to_string(),"99".to_string()),
+        ("secret".to_string(),               "prod".to_string()),
+        ("partition_on".to_string(),         "id".to_string()),
+        ("partition_num".to_string(),        "8".to_string()),
+        ("partition_min".to_string(),        "0".to_string()),
+        ("partition_max".to_string(),        "99".to_string()),
+        ("statement_timeout_ms".to_string(), "30000".to_string()),
     ];
-    let (secret, args) = parse_named_args(&pairs).unwrap();
-    assert_eq!(secret.unwrap(), "prod");
+    let parsed = parse_named_args(&pairs).unwrap();
+    assert_eq!(parsed.secret.as_deref(), Some("prod"));
+    assert_eq!(parsed.statement_timeout_ms, Some(30_000));
     let want = PartitionArgs {
         partition_on:  Some("id".into()),
         partition_num: Some(8),
         partition_min: Some(0),
         partition_max: Some(99),
     };
-    assert_eq!(format!("{args:?}"), format!("{want:?}"));
+    assert_eq!(format!("{:?}", parsed.partition), format!("{want:?}"));
 }
 
 #[test]
 fn unknown_arg_errors() {
     let pairs = vec![("yolo".to_string(), "true".to_string())];
+    assert!(parse_named_args(&pairs).is_err());
+}
+
+#[test]
+fn negative_timeout_errors() {
+    let pairs = vec![("statement_timeout_ms".to_string(), "-1".to_string())];
     assert!(parse_named_args(&pairs).is_err());
 }
 ```
@@ -1567,7 +1938,7 @@ Write `src/scan.rs`:
 use crate::config::{resolve_from_env, Config};
 use crate::error::DuckxError;
 use crate::partition::{validate, PartitionArgs, PartitionSpec};
-use crate::pipeline::run_pipeline;
+use crate::pipeline::{discover_bounds, run_pipeline};
 use crate::secret::lookup_secret;
 use crate::types::arrow_to_duckdb;
 
@@ -1576,22 +1947,35 @@ use duckdb::core::{DataChunkHandle, LogicalTypeHandle, LogicalTypeId};
 use duckdb::vtab::{BindInfo, Free, FunctionInfo, InitInfo, VTab};
 use duckdb::Connection;
 
-pub fn parse_named_args(
-    pairs: &[(String, String)],
-) -> Result<(Option<String>, PartitionArgs), DuckxError> {
-    let mut secret = None;
-    let mut args = PartitionArgs::default();
+#[derive(Debug, Default)]
+pub struct ParsedArgs {
+    pub secret: Option<String>,
+    pub partition: PartitionArgs,
+    pub statement_timeout_ms: Option<i64>,
+}
+
+pub fn parse_named_args(pairs: &[(String, String)]) -> Result<ParsedArgs, DuckxError> {
+    let mut out = ParsedArgs::default();
     for (k, v) in pairs {
         match k.as_str() {
-            "secret"        => secret = Some(v.clone()),
-            "partition_on"  => args.partition_on = Some(v.clone()),
-            "partition_num" => args.partition_num = Some(parse_i64(v, k)?),
-            "partition_min" => args.partition_min = Some(parse_i64(v, k)?),
-            "partition_max" => args.partition_max = Some(parse_i64(v, k)?),
+            "secret"        => out.secret = Some(v.clone()),
+            "partition_on"  => out.partition.partition_on = Some(v.clone()),
+            "partition_num" => out.partition.partition_num = Some(parse_i64(v, k)?),
+            "partition_min" => out.partition.partition_min = Some(parse_i64(v, k)?),
+            "partition_max" => out.partition.partition_max = Some(parse_i64(v, k)?),
+            "statement_timeout_ms" => {
+                let t = parse_i64(v, k)?;
+                if t <= 0 {
+                    return Err(DuckxError::BadDsn(format!(
+                        "statement_timeout_ms must be > 0, got {t}"
+                    )));
+                }
+                out.statement_timeout_ms = Some(t);
+            }
             other => return Err(DuckxError::BadDsn(format!("unknown named arg: {other}"))),
         }
     }
-    Ok((secret, args))
+    Ok(out)
 }
 
 fn parse_i64(s: &str, name: &str) -> Result<i64, DuckxError> {
@@ -1604,6 +1988,7 @@ pub struct ScanBindData {
     cfg: Config,
     query: String,
     spec: PartitionSpec,
+    statement_timeout_ms: Option<i64>,
     schema: arrow::datatypes::SchemaRef,
 }
 impl Free for ScanBindData {}
@@ -1621,20 +2006,19 @@ impl VTab for RedshiftScanVTab {
     type BindData = ScanBindData;
 
     fn bind(bind: &BindInfo, data: *mut ScanBindData) -> Result<(), Box<dyn std::error::Error>> {
-        let positional = bind.get_parameter(0).to_string();
-        let query = positional;
+        let query = bind.get_parameter(0).to_string();
         let pairs: Vec<(String, String)> = (0..bind.num_named_parameters())
             .map(|i| (bind.named_parameter_name(i).into(), bind.named_parameter(i).to_string()))
             .collect();
-        let (secret_name, partition_args) = parse_named_args(&pairs)?;
+        let parsed = parse_named_args(&pairs)?;
 
-        let cfg = match secret_name {
+        let cfg = match parsed.secret {
             Some(name) => lookup_secret(bind.connection(), &name)?,
             None => resolve_from_env()?,
         };
-        let spec = validate(&partition_args)?;
+        let spec = validate(&parsed.partition)?;
 
-        // Schema discovery: LIMIT 0 round-trip.
+        // Schema discovery: LIMIT 0 round-trip on a Single-spec pipeline.
         let probe_query = format!("SELECT * FROM ({query}) AS __duckx_probe LIMIT 0");
         let mut probe_iter = run_pipeline(&cfg, &probe_query, &PartitionSpec::Single)?;
         let probe_batch = probe_iter
@@ -1652,6 +2036,7 @@ impl VTab for RedshiftScanVTab {
                 cfg,
                 query,
                 spec,
+                statement_timeout_ms: parsed.statement_timeout_ms,
                 schema,
             });
         }
@@ -1660,7 +2045,25 @@ impl VTab for RedshiftScanVTab {
 
     fn init(init: &InitInfo, data: *mut ScanInitData) -> Result<(), Box<dyn std::error::Error>> {
         let bind = unsafe { &*init.get_bind_data::<ScanBindData>() };
-        let iter = run_pipeline(&bind.cfg, &bind.query, &bind.spec)?;
+
+        // Resolve any pending bound discovery exactly once, here.
+        let final_spec = match &bind.spec {
+            PartitionSpec::Parallel { column, num, bounds: None } => {
+                let (lo, hi) = discover_bounds(&bind.cfg, &bind.query, column)?;
+                PartitionSpec::Parallel { column: column.clone(), num: *num, bounds: Some((lo, hi)) }
+            }
+            other => other.clone(),
+        };
+
+        // statement_timeout_ms is applied via a SET prepended to each
+        // partition query when it's set. connectorx executes each query
+        // verbatim, so prefix the user query with the SET.
+        let query = match bind.statement_timeout_ms {
+            Some(ms) => format!("SET statement_timeout = {ms}; {q}", q = bind.query),
+            None => bind.query.clone(),
+        };
+
+        let iter = run_pipeline(&bind.cfg, &query, &final_spec)?;
         unsafe {
             std::ptr::write(data, ScanInitData { iter: Some(iter) });
         }
@@ -1679,14 +2082,21 @@ impl VTab for RedshiftScanVTab {
 }
 
 /// Copy an Arrow `RecordBatch` into a DuckDB `DataChunkHandle` via the
-/// C-data interface. duckdb-rs exposes a helper that takes an
-/// `&dyn arrow::array::Array` per column.
+/// C-data interface.
+///
+/// Implementation strategy is determined by Task 2 (hello-world spike):
+/// - If `DataChunkHandle::vector(i).set_arrow(...)` exists in the pinned
+///   duckdb-rs version, use it (zero-copy fast path).
+/// - Otherwise, dispatch on `LogicalTypeId` and copy column values
+///   element-wise. The fallback adds ~200 LOC and ~5–15 % overhead.
+///
+/// Task 2's spike README records which path is available; this function
+/// must use that recorded path. If `set_arrow` exists, the body below
+/// works as written; if not, replace with the element-wise dispatcher
+/// described in Task 2's README.
 fn copy_batch_into_chunk(batch: &RecordBatch, chunk: &mut DataChunkHandle) -> Result<(), DuckxError> {
     let n_rows = batch.num_rows();
     for (i, col) in batch.columns().iter().enumerate() {
-        // duckdb-rs >= 1.4 provides DataChunkHandle::vector(i).set_arrow(...).
-        // Fall back to copy-by-element if the helper isn't present in the
-        // pinned version.
         chunk
             .vector(i)
             .set_arrow(col.as_ref())
@@ -1701,11 +2111,12 @@ pub fn register(conn: &Connection) -> Result<(), Box<dyn std::error::Error>> {
     let func = TableFunction::default()
         .set_name("redshift_scan")
         .add_parameter(LogicalTypeHandle::from(LogicalTypeId::Varchar))
-        .add_named_parameter("secret",        LogicalTypeHandle::from(LogicalTypeId::Varchar))
-        .add_named_parameter("partition_on",  LogicalTypeHandle::from(LogicalTypeId::Varchar))
-        .add_named_parameter("partition_num", LogicalTypeHandle::from(LogicalTypeId::Bigint))
-        .add_named_parameter("partition_min", LogicalTypeHandle::from(LogicalTypeId::Bigint))
-        .add_named_parameter("partition_max", LogicalTypeHandle::from(LogicalTypeId::Bigint))
+        .add_named_parameter("secret",               LogicalTypeHandle::from(LogicalTypeId::Varchar))
+        .add_named_parameter("partition_on",         LogicalTypeHandle::from(LogicalTypeId::Varchar))
+        .add_named_parameter("partition_num",        LogicalTypeHandle::from(LogicalTypeId::Bigint))
+        .add_named_parameter("partition_min",        LogicalTypeHandle::from(LogicalTypeId::Bigint))
+        .add_named_parameter("partition_max",        LogicalTypeHandle::from(LogicalTypeId::Bigint))
+        .add_named_parameter("statement_timeout_ms", LogicalTypeHandle::from(LogicalTypeId::Bigint))
         .supports_pushdown(false);
     conn.register_table_function::<RedshiftScanVTab>(func)?;
     Ok(())
@@ -1769,14 +2180,43 @@ use duckdb_loadable_macros::duckdb_entrypoint_c_api;
 
 #[duckdb_entrypoint_c_api]
 pub fn extension_entrypoint(con: Connection) -> Result<(), Box<dyn std::error::Error>> {
-    secret::register_redshift_secret_type(&con)?;
-    scan::register(&con)?;
+    verify_duckdb_version(&con)?;
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_env("DUCKX_LOG").unwrap_or_else(|_| "off".into()),
         )
         .try_init()
         .ok();
+    secret::register_redshift_secret_type(&con)?;
+    scan::register(&con)?;
+    Ok(())
+}
+
+/// Hard-fail if the running DuckDB's `version()` doesn't match the
+/// version this binary was compiled against.
+///
+/// Only the `MAJOR.MINOR` prefix is compared — patch releases keep ABI
+/// compatibility, but minor releases can break the extension ABI.
+fn verify_duckdb_version(con: &Connection) -> Result<(), Box<dyn std::error::Error>> {
+    let runtime: String = con.query_row("SELECT version()", [], |r| r.get(0))?;
+    let runtime_mm = runtime
+        .trim_start_matches('v')
+        .split('.')
+        .take(2)
+        .collect::<Vec<_>>()
+        .join(".");
+    let pinned_mm = DUCKDB_VERSION
+        .split('.')
+        .take(2)
+        .collect::<Vec<_>>()
+        .join(".");
+    if runtime_mm != pinned_mm {
+        return Err(format!(
+            "duckx extension was built for DuckDB {pinned_mm}.x, but loaded into {runtime}. \
+             Rebuild duckx against this DuckDB version, or use a matching DuckDB binary."
+        )
+        .into());
+    }
     Ok(())
 }
 ```
@@ -1825,6 +2265,7 @@ fn load_and_count_via_env_auth() {
     std::env::set_var("REDSHIFT_USER", "postgres");
     std::env::set_var("REDSHIFT_PASSWORD", "postgres");
     std::env::set_var("REDSHIFT_DATABASE", "postgres");
+    std::env::set_var("REDSHIFT_SSLMODE", "disable"); // testcontainers Postgres has no TLS
 
     let ext = build_extension();
     let sql = format!(
@@ -1859,12 +2300,36 @@ git commit -m "feat(lib): wire extension entrypoint registering REDSHIFT secret 
 
 > Depends on Task 11. Runs in parallel with Tasks 13 and 14.
 
-**Files:**
+**Files (single-binary integration test layout, required for `mod common;` to work):**
+- Create: `tests/integration_pg/main.rs` — declares submodules; cargo treats this whole directory as one test binary.
+- Create: `tests/integration_pg/common/mod.rs`
 - Create: `tests/integration_pg/wide_types.rs`
 - Create: `tests/integration_pg/auth_paths.rs`
 - Create: `tests/integration_pg/partition_equivalence.rs`
-- Create: `tests/integration_pg/cancellation.rs`
-- Create: `tests/integration_pg/common/mod.rs`
+- Create: `tests/integration_pg/connection_drop.rs` (renamed from "cancellation"; see Step 5)
+- Modify: `Cargo.toml` — under `[[test]]` declare `name = "integration_pg"`, `path = "tests/integration_pg/main.rs"`.
+
+- [ ] **Step 0: Declare the integration test as a single binary**
+
+Add to `Cargo.toml`:
+
+```toml
+[[test]]
+name = "integration_pg"
+path = "tests/integration_pg/main.rs"
+```
+
+Write `tests/integration_pg/main.rs`:
+
+```rust
+mod common;
+mod wide_types;
+mod auth_paths;
+mod partition_equivalence;
+mod connection_drop;
+```
+
+This makes the directory a single test crate so `mod common;` resolves consistently across files. Without this, Cargo treats each `.rs` file as its own binary and `mod common;` fails.
 
 - [ ] **Step 1: Factor out the test harness**
 
@@ -1902,8 +2367,7 @@ pub fn extension_path() -> std::path::PathBuf {
 Write `tests/integration_pg/wide_types.rs`:
 
 ```rust
-mod common;
-use common::*;
+use crate::common::*;
 
 #[test]
 fn every_supported_type_round_trips() {
@@ -1953,8 +2417,7 @@ fn every_supported_type_round_trips() {
 Write `tests/integration_pg/auth_paths.rs`:
 
 ```rust
-mod common;
-use common::*;
+use crate::common::*;
 
 fn seed(h: &Harness) {
     let mut c = postgres::Client::connect(&h.dsn, postgres::NoTls).unwrap();
@@ -1967,7 +2430,7 @@ fn secret_path_works() {
     seed(&h);
     let sql = format!(
         "SET allow_unsigned_extensions = true; LOAD '{}'; \
-         CREATE SECRET s (TYPE REDSHIFT, HOST '127.0.0.1', PORT {p}, USER 'postgres', PASSWORD 'postgres', DATABASE 'postgres'); \
+         CREATE SECRET s (TYPE REDSHIFT, HOST '127.0.0.1', PORT '{p}', USER 'postgres', PASSWORD 'postgres', DATABASE 'postgres', SSLMODE 'disable'); \
          SELECT count(*) FROM redshift_scan('SELECT * FROM k', secret => 's');",
         extension_path().display(), p = h.port
     );
@@ -2000,8 +2463,7 @@ fn missing_credentials_lists_fields() {
 Write `tests/integration_pg/partition_equivalence.rs`:
 
 ```rust
-mod common;
-use common::*;
+use crate::common::*;
 
 #[test]
 fn partitioned_count_matches_unpartitioned() {
@@ -2031,28 +2493,36 @@ fn partitioned_count_matches_unpartitioned() {
 }
 ```
 
-- [ ] **Step 5: Cancellation test**
+- [ ] **Step 5: Connection-drop test**
 
-Write `tests/integration_pg/cancellation.rs`:
+Renamed from "cancellation" — this test validates that a dropped Postgres backend surfaces a clean `RedshiftError`. True user-initiated cancellation (SIGINT mid-stream) is out of scope for v1 because cancellation requires DuckDB-side cooperation we don't yet wire.
+
+Write `tests/integration_pg/connection_drop.rs`:
 
 ```rust
-mod common;
-use common::*;
+use crate::common::*;
 
 #[test]
-fn killing_postgres_mid_scan_surfaces_error() {
-    let h = start();
-    let mut c = postgres::Client::connect(&h.dsn, postgres::NoTls).unwrap();
-    c.batch_execute(
-        "CREATE TABLE z (id INT); INSERT INTO z SELECT g FROM generate_series(1, 100) g;",
-    ).unwrap();
+fn unreachable_postgres_surfaces_redshift_error() {
+    // Hold the harness only long enough to capture port+dsn, then drop it.
+    let port_to_use;
+    let dsn_for_seed;
+    {
+        let h = start();
+        port_to_use = h.port;
+        dsn_for_seed = h.dsn.clone();
+        let mut c = postgres::Client::connect(&dsn_for_seed, postgres::NoTls).unwrap();
+        c.batch_execute(
+            "CREATE TABLE z (id INT); INSERT INTO z SELECT g FROM generate_series(1, 100) g;",
+        ).unwrap();
+    } // h drops here, container stops
+
     std::env::set_var("REDSHIFT_HOST", "127.0.0.1");
-    std::env::set_var("REDSHIFT_PORT", h.port.to_string());
+    std::env::set_var("REDSHIFT_PORT", port_to_use.to_string());
     std::env::set_var("REDSHIFT_USER", "postgres");
     std::env::set_var("REDSHIFT_PASSWORD", "postgres");
     std::env::set_var("REDSHIFT_DATABASE", "postgres");
-
-    drop(h); // stops the container; subsequent queries error
+    std::env::set_var("REDSHIFT_SSLMODE", "disable");
 
     let sql = format!(
         "SET allow_unsigned_extensions = true; LOAD '{}'; \
@@ -2062,7 +2532,10 @@ fn killing_postgres_mid_scan_surfaces_error() {
     let out = duckdb(&sql);
     assert!(!out.status.success());
     let err = String::from_utf8_lossy(&out.stderr).to_lowercase();
-    assert!(err.contains("redshift error") || err.contains("connect"), "stderr: {err}");
+    assert!(
+        err.contains("redshift error") || err.contains("connect") || err.contains("refused"),
+        "stderr: {err}"
+    );
 }
 ```
 
@@ -2171,9 +2644,9 @@ fn partitioned_read_across_compute_nodes() {
 }
 ```
 
-- [ ] **Step 2: Document the env contract**
+- [ ] **Step 2: Document the env contract and fixture SQL**
 
-Append to `README.md` (created in Task 14, or stub now if README is empty):
+Append to `README.md` (created in Task 14; if README is still the original one-liner, replace that with this section now and Task 14 will fill in the rest):
 
 ```markdown
 ## Real-Redshift integration tests
@@ -2186,10 +2659,37 @@ These tests are gated behind `--features redshift-integration` and read:
 - `REDSHIFT_TEST_PARTITION_TABLE` (default `public.duckx_partition_test`)
 - `REDSHIFT_TEST_PARTITION_COLUMN` (default `id`)
 
-The `duckx_partition_test` table must exist with at least 100k rows and an
-indexed integer partition column. Run before tagging a release:
+### One-time fixture setup
 
-  cargo test --release --features redshift-integration -- --test-threads=1
+Run once against the staging cluster:
+
+    CREATE TABLE IF NOT EXISTS public.duckx_partition_test (
+        id   BIGINT NOT NULL,
+        name VARCHAR(64)
+    )
+    DISTKEY(id) SORTKEY(id);
+
+    -- Seed 1M rows. Re-running is idempotent because of TRUNCATE.
+    TRUNCATE public.duckx_partition_test;
+    INSERT INTO public.duckx_partition_test
+    SELECT i AS id, 'row-' || i AS name
+    FROM (
+        SELECT row_number() OVER () AS i
+        FROM stl_scan
+        LIMIT 1000000
+    );
+
+    GRANT SELECT ON public.duckx_partition_test TO <test_user>;
+
+### Teardown (only if removing the cluster)
+
+    DROP TABLE IF EXISTS public.duckx_partition_test;
+
+### Running
+
+Run before tagging a release:
+
+    cargo test --release --features redshift-integration -- --test-threads=1
 ```
 
 - [ ] **Step 3: Verify the gated suite compiles without the feature**
@@ -2212,10 +2712,21 @@ git commit -m "test: add gated real-Redshift integration suite"
 > Runs in parallel with Tasks 12 and 13.
 
 **Files:**
-- Modify: `README.md` (replace existing one-liner)
-- Modify: `.github/workflows/ci.yml` — add the macos-arm64 + linux-arm64 slots, release-tag artifact upload
+- Modify: `README.md` (replace existing one-liner; preserve any section Task 13 added)
+- Modify: `.github/workflows/ci.yml` — add the macos-arm64 + linux-arm64 slots (via `cargo-zigbuild`), release-tag artifact upload
 - Create: `.github/workflows/release.yml` — builds + uploads the `.duckdb_extension` artifact per platform on tag push
+- Create: `LICENSE` (Apache-2.0 text)
 - Create: `RELEASE_CHECKLIST.md`
+
+- [ ] **Step 0: Add the LICENSE file**
+
+Run:
+
+```bash
+curl -L -o LICENSE https://www.apache.org/licenses/LICENSE-2.0.txt
+```
+
+Verify the file is non-empty and starts with `Apache License`. Update the copyright placeholder at the bottom (`[yyyy] [name of copyright owner]`) to `2026 duckx contributors`.
 
 - [ ] **Step 1: Write `README.md`**
 
@@ -2320,15 +2831,19 @@ jobs:
       matrix:
         include:
           - { os: ubuntu-latest, target: x86_64-unknown-linux-gnu, duckdb_asset: duckdb_cli-linux-amd64.zip }
-          - { os: ubuntu-latest, target: aarch64-unknown-linux-gnu, duckdb_asset: duckdb_cli-linux-aarch64.zip, cross: true }
+          - { os: ubuntu-latest, target: aarch64-unknown-linux-gnu, duckdb_asset: duckdb_cli-linux-aarch64.zip, cross: zigbuild }
           - { os: macos-14,      target: aarch64-apple-darwin,     duckdb_asset: duckdb_cli-osx-universal.zip }
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with: { components: rustfmt, clippy, targets: ${{ matrix.target }} }
+      - name: Install zig and cargo-zigbuild (cross targets only)
+        if: matrix.cross == 'zigbuild'
+        run: |
+          pip install ziglang cargo-zigbuild
       - name: Install DuckDB CLI
-        if: matrix.cross != true
+        if: matrix.cross != 'zigbuild'
         run: |
           if [ "$RUNNER_OS" = "macOS" ]; then
             brew install duckdb
@@ -2338,11 +2853,16 @@ jobs:
           fi
       - run: cargo fmt --all -- --check
       - run: cargo clippy --all-targets --target ${{ matrix.target }} -- -D warnings
-      - run: cargo build --release --target ${{ matrix.target }}
+      - name: Build (native)
+        if: matrix.cross != 'zigbuild'
+        run: cargo build --release --target ${{ matrix.target }}
+      - name: Build (zigbuild cross)
+        if: matrix.cross == 'zigbuild'
+        run: cargo zigbuild --release --target ${{ matrix.target }}
       - run: cargo xtask package
-        if: matrix.cross != true
+        if: matrix.cross != 'zigbuild'
       - run: cargo test --release -- --test-threads=1
-        if: matrix.cross != true
+        if: matrix.cross != 'zigbuild'
 ```
 
 - [ ] **Step 3: Release workflow**
@@ -2419,8 +2939,8 @@ Expected: all clean, all green.
 - [ ] **Step 6: Commit**
 
 ```bash
-git add README.md .github/workflows RELEASE_CHECKLIST.md
-git commit -m "docs+ci: README, multi-platform CI, release workflow, release checklist"
+git add README.md LICENSE .github/workflows RELEASE_CHECKLIST.md
+git commit -m "docs+ci: README, LICENSE, multi-platform CI with zigbuild, release workflow"
 ```
 
 ---
@@ -2432,37 +2952,48 @@ git commit -m "docs+ci: README, multi-platform CI, release workflow, release che
 | Spec section / requirement | Covered by task |
 |---|---|
 | `redshift_scan` table function | Tasks 10, 11 |
-| Auth: explicit secret | Task 6 |
-| Auth: env vars + default port 5439 | Task 5 |
+| Auth: explicit secret | Task 6 (gated by 2.5 spike) |
+| Auth: env vars + default port 5439 + sslmode | Task 5 |
 | Auth: missing-field error | Tasks 5, 12 (auth_paths) |
+| TLS / `sslmode` default `require` | Tasks 5, 6, 9 (TLS connector) |
 | Partitioned parallel reads | Tasks 8, 9, 12 |
+| `partition_num=1` → Single | Task 8 |
+| `statement_timeout_ms` arg | Task 10 |
+| SQL-injection-safe partition column | Tasks 5 (validator), 8, 9 |
 | Streaming, no full materialization | Task 9 (channel iterator) |
-| Type mapping | Task 7, 12 (wide_types) |
-| Unsupported-type errors (`SUPER` et al.) | Tasks 7, 13 |
-| `DuckxError` + redaction | Task 4 |
+| Type mapping (incl. `Hugeint` for `UInt64`) | Task 7, 12 (wide_types) |
+| Unsupported-type errors (`SUPER`, `INTERVAL`, `TIMETZ`, `OID`, …) | Tasks 7, 13 |
+| `DuckxError` + redaction (keyword + URL form) | Task 4 |
 | Module boundaries (config / pipeline / scan / secret separation) | Tasks 5–10 |
 | `arrow` vs `arrow2` de-risk | Task 1 |
 | `duckdb-rs` extension API de-risk | Task 2 |
-| DuckDB version pin | Tasks 2, 3 |
+| DuckDB Secrets API de-risk | Task 2.5 |
+| `set_arrow` helper de-risk | Task 2 (verify) + Task 10 (fallback note) |
+| DuckDB version pin + runtime check | Tasks 2, 3, 11 |
 | Postgres CI integration tests | Tasks 9, 11, 12 |
-| Real-Redshift gated suite | Task 13 |
+| Real-Redshift gated suite + fixture SQL | Task 13 |
 | Build / `xtask package` / `.duckdb_extension` artifact | Task 3 |
-| CI matrix (linux/macos) | Task 14 |
+| CI matrix (linux-amd64, linux-arm64 via zigbuild, macos-arm64) | Task 14 |
 | Release artifacts | Task 14 |
-| README documenting auth + unsigned `LOAD` | Task 14 |
+| LICENSE | Task 14 |
+| README documenting auth + TLS + unsigned `LOAD` | Tasks 13, 14 |
 | Logging via `DUCKX_LOG` | Tasks 11, 14 (README) |
-| Cancellation / mid-stream drop | Task 12 (cancellation) |
-| `LIMIT 0` schema discovery | Task 10 |
-| Future-work hooks (modules positioned for `ATTACH` / IAM) | Spec only — implicitly covered by module split in Tasks 5–10 |
+| Connection-drop / mid-stream error path | Task 12 (connection_drop) |
+| `LIMIT 0` schema discovery (Single, no double-execution) | Task 10 |
+| Bound discovery exactly once at init | Tasks 9, 10 |
+| Concurrency / connection model documented | Spec; matches Task 9 implementation |
+| Future-work hooks (modules positioned for `ATTACH` / IAM / pool) | Spec only — implicitly covered by module split in Tasks 5–10 |
 
 No gaps.
 
-**Placeholder scan:** searched plan for `TODO`, `TBD`, `fill in`, `similar to Task`, "appropriate error handling" — none remain in step bodies. Two notes deliberately left as decision points (the connectorx version pin in Task 1's `Cargo.toml` and the duckdb-rs API check in Task 6 Step 1) — these are explicit "verify before writing" cues, not placeholders.
+**Placeholder scan:** searched plan for `TODO`, `TBD`, `fill in`, `similar to Task`, "appropriate error handling" — placeholders only remain as documented decision points: Task 1 connectorx version (verified at run time), Task 6's two `todo!()`s explicitly to be replaced from the Task 2.5 spike output (with a test gate that catches them), Task 10's `set_arrow` body annotated with the Task 2 fallback contract. None are unresolved.
 
 **Type consistency:**
-- `Config` fields (`host`, `port: u16`, `user`, `password: SecretString`, `database`): consistent across Tasks 5, 6, 9, 10.
+- `Config` fields (`host`, `port: u16`, `user`, `password: SecretString`, `database`, `sslmode: SslMode`): consistent across Tasks 5, 6, 9, 10.
+- `SslMode` enum: defined in Task 5, consumed in Tasks 6, 9.
 - `PartitionSpec` variants (`Single` | `Parallel { column, num: u32, bounds: Option<(i64, i64)> }`): consistent in Tasks 8, 9, 10.
 - `DuckxError` variants used: `MissingCredential`, `BadDsn`, `RedshiftError`, `UnsupportedType`, `PartitionBoundsInvalid`, `BatchDecode` — all match Task 4's definition.
-- Function names: `resolve_from_env` (Task 5), `lookup_secret` / `register_redshift_secret_type` (Task 6), `arrow_to_duckdb` (Task 7), `validate` (Task 8), `run_pipeline` (Task 9), `parse_named_args` / `register` (Task 10) — referenced consistently downstream.
+- Function names: `resolve_from_env`, `validate_identifier`, `SslMode::parse` (Task 5); `lookup_secret`, `register_redshift_secret_type` (Task 6); `arrow_to_duckdb` (Task 7); `validate` (Task 8); `run_pipeline`, `discover_bounds` (Task 9); `parse_named_args`, `register` (Task 10); `verify_duckdb_version` (Task 11) — referenced consistently downstream.
+- `ParsedArgs` struct (Task 10) replaces the earlier tuple return — every caller goes through fields, not positional access.
 
 No inconsistencies found.

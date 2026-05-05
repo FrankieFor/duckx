@@ -11,14 +11,20 @@ Ship `duckx`, a Rust-built DuckDB extension that lets a user query Amazon Redshi
 ## Goals
 
 - A DuckDB user can run `SELECT * FROM redshift_scan('SELECT * FROM sales WHERE dt > current_date - 7')` in any DuckDB session that has loaded the extension and gets the rows back.
-- Credentials live in a DuckDB Secret or in environment variables — never in the SQL string.
+- Credentials are sourced from a DuckDB Secret or from environment variables. Users cannot supply a connection DSN directly through the table function; the DSN is constructed internally from resolved fields.
+- Connections to Redshift use TLS by default (`sslmode=require`). Plaintext connections are opt-in only.
 - Partitioned parallel reads are available as opt-in arguments and produce identical results to an unpartitioned scan.
 - The extension streams results (no full materialization in extension memory) and propagates Redshift errors with clear, PII-safe messages.
 - The architecture is structured so that `ATTACH 'redshift://…'` and IAM auth can be added later as new modules without rewriting the v1 code paths.
 
+### Performance budgets
+
+- Schema discovery (`LIMIT 0` round-trip) adds < 500 ms p50 over a direct `psql` query when the cluster is in the same AWS region as the client.
+- Total `redshift_scan` overhead over a direct `psql` extract of the same query is < 1.0× wall-clock for queries returning ≥ 100 k rows (i.e., the extension does not more than double extract time).
+
 ## Non-Goals
 
-- Replacing `UNLOAD … TO 's3://'` for very large extracts. README will document that for >100M-row extracts, `UNLOAD` + `read_parquet` is faster; `redshift_scan` targets ad-hoc / interactive use up to tens of millions of rows.
+- Replacing `UNLOAD … TO 's3://'` for very large extracts. README will document that for extracts above ~50 M rows, `UNLOAD` + `read_parquet` is faster; `redshift_scan` targets ad-hoc / interactive use up to tens of millions of rows.
 - Writes / DML to Redshift.
 
 ## Out of Scope (v1)
@@ -55,8 +61,9 @@ Arguments:
 | `partition_num` | `BIGINT` | no | `1` | Number of parallel connections. Requires `partition_on`. |
 | `partition_min` | `BIGINT` | no | auto | If omitted, discovered via `SELECT MIN(col)` on the user query. |
 | `partition_max` | `BIGINT` | no | auto | If omitted, discovered via `SELECT MAX(col)`. |
+| `statement_timeout_ms` | `BIGINT` | no | — | If set, issues `SET statement_timeout = N` on each Redshift connection before running the query. |
 
-Unknown named args are rejected at bind time. `partition_num` without `partition_on` errors. `partition_min > partition_max` errors.
+Unknown named args are rejected at bind time. `partition_num` without `partition_on` errors. `partition_min > partition_max` errors. `partition_num = 1` is treated as the unpartitioned case (single connection); `partition_num` must be in `[1, 64]`. `partition_on` must match `^[A-Za-z_][A-Za-z0-9_]*$` (validated at bind time) and is double-quoted when interpolated into partition SQL to support mixed-case identifiers safely.
 
 ### Credentials
 
@@ -69,17 +76,22 @@ CREATE SECRET redshift_prod (
   PORT 5439,
   USER 'analyst',
   PASSWORD 'hunter2',
-  DATABASE 'analytics'
+  DATABASE 'analytics',
+  SSLMODE 'require'
 );
 ```
 
 Resolution order on each call:
 
 1. Explicit `secret => 'name'` arg — looked up via the DuckDB Secrets Manager.
-2. Environment variables: `REDSHIFT_HOST`, `REDSHIFT_PORT` (default `5439`), `REDSHIFT_USER`, `REDSHIFT_PASSWORD`, `REDSHIFT_DATABASE`.
+2. Environment variables: `REDSHIFT_HOST`, `REDSHIFT_PORT` (default `5439`), `REDSHIFT_USER`, `REDSHIFT_PASSWORD`, `REDSHIFT_DATABASE`, `REDSHIFT_SSLMODE` (default `require`).
 3. Error: `MissingCredential { fields: [...] }` listing exactly which fields could not be resolved.
 
-There is no plain DSN-with-embedded-password path.
+Users do not pass a DSN string to the table function. Internally, the resolved `Config` is rendered into a libpq DSN with URL-encoded password and `sslmode` parameter for connectorx; that internal DSN never leaves the process and is never logged.
+
+### TLS
+
+`sslmode` accepts `disable`, `prefer`, `require`, `verify-ca`, `verify-full`. Default is `require` — Redshift clusters reject plaintext by default and AWS recommends TLS. Setting `sslmode=disable` is permitted for local Postgres test fixtures only and emits a `tracing::warn!` log.
 
 ## Architecture
 
@@ -136,20 +148,47 @@ This is also the seam for v2 features: `ATTACH` becomes a new module alongside `
 
 ### Memory model
 
-No batch is ever fully materialized in extension memory. At most `partition_num × 1` Arrow batches are in flight (channel bound = N). Default Arrow batch size is connectorx's default (~64K rows).
+No batch is ever fully materialized in extension memory. At most `partition_num × 1` Arrow batches are in flight (channel bound = N). Default Arrow batch size is connectorx's default (~64 K rows). Worst-case peak in-flight rows: `64 × 64 K ≈ 4 M rows`. For typical row sizes of ~256 B, that's ~1 GB of in-flight data — documented as the practical upper bound and the reason `partition_num` is capped at 64.
+
+### Concurrency and connection model
+
+Each `redshift_scan` call opens a fresh set of Redshift connections — `partition_num` connections per call (so the `Single` case opens 1, `Parallel { num: 8 }` opens 8). Connections close when the scan finishes or the iterator is dropped (cancellation path).
+
+There is no connection pool in v1; sessions issuing many small `redshift_scan` calls will repeatedly establish and tear down connections. Pooling is named in Future Work; v1 callers running tight loops should partition by hand or batch their queries.
 
 ## Type Mapping
 
 connectorx returns Arrow types via the Postgres-protocol path. We map Arrow → DuckDB through `duckdb-rs`'s built-in C-data interface (verified against the type matrix in tests).
 
-Redshift-specific types not representable in Arrow error explicitly with the column name and the offending Redshift type:
+| Arrow type | DuckDB logical type |
+|---|---|
+| `Boolean` | `BOOLEAN` |
+| `Int8`, `Int16` | `SMALLINT` |
+| `Int32`, `UInt8`, `UInt16` | `INTEGER` |
+| `Int64`, `UInt32` | `BIGINT` |
+| `UInt64` | `HUGEINT` |
+| `Float32` | `FLOAT` |
+| `Float64` | `DOUBLE` |
+| `Utf8`, `LargeUtf8` | `VARCHAR` |
+| `Binary`, `LargeBinary`, `FixedSizeBinary(_)` | `BLOB` |
+| `Date32`, `Date64` | `DATE` |
+| `Time32(_)`, `Time64(_)` | `TIME` |
+| `Timestamp(_, None)` | `TIMESTAMP` |
+| `Timestamp(_, Some(tz))` | `TIMESTAMPTZ` |
+| `Decimal128(p, s)`, `Decimal256(p, s)` | `DECIMAL(p, s)` |
 
-- `SUPER`
+Anything else falls through to `UnsupportedType { column, type_name }` — the mapping is best-effort, not exhaustive. Known Redshift / Postgres types that will hit this fallthrough today:
+
+- `SUPER` (Redshift JSON / semistructured)
 - `GEOMETRY` / `GEOGRAPHY`
 - `HLLSKETCH`
 - `VARBYTE` (revisit if connectorx adds support)
+- `INTERVAL`
+- `TIME WITH TIME ZONE` (`TIMETZ`)
+- `OID` and other Postgres system types
+- Any Arrow `List`, `Struct`, `Map`, `Union` arrays returned by future connectorx changes
 
-Error variant: `UnsupportedType { column, type_name }`.
+Workaround for users: `CAST(col AS VARCHAR)` in the user query.
 
 ## Error Handling
 
@@ -237,6 +276,7 @@ connectorx and the DuckDB extension surface are never mocked in unit tests. Post
 
 - **`ATTACH 'redshift://…' AS rs`** — implement DuckDB `Catalog` / `StorageExtension`; expose Redshift schemas/tables; add filter & projection pushdown via `BindReplace`. Reuses `config` and `pipeline` unchanged.
 - **IAM auth** — new `secret.rs` variant `TYPE REDSHIFT_IAM` plus AWS SDK call to `GetClusterCredentials`; resolves to a `Config` with a 15-minute-lived password. Plumbing above `config` does not change.
+- **Connection pool** — keyed by resolved `Config`; reuses connections across `redshift_scan` calls within a DuckDB session.
 - **Schema cache** keyed on `(secret_name, query_hash)`.
 - **Community Extensions submission** + signed binaries.
 - **`UNLOAD` fast path** — for queries above a row threshold, transparently use `UNLOAD … TO 's3://…' FORMAT PARQUET` and read back via `httpfs`; behind `via => 's3'` arg.
@@ -245,10 +285,13 @@ connectorx and the DuckDB extension surface are never mocked in unit tests. Post
 
 - **Extension over CLI.** User wants to query Redshift *from* a DuckDB session, not pipe data into one.
 - **Table function in v1, `ATTACH` in v2.** Table function is a few hundred lines; `ATTACH` with pushdown is a multi-week project. Architecture is structured so v2 reuses v1 modules unchanged.
-- **DuckDB Secret + env, no in-DSN password.** Removes the most common credential leak vector; matches DuckDB conventions.
-- **Opt-in partitioning.** Connectorx's headline feature; making it opt-in keeps the simple case simple.
+- **No user-supplied DSN.** Users go through Secret or env; the internal libpq DSN never leaves the process. Removes the most common credential leak vector and matches DuckDB conventions.
+- **TLS by default.** `sslmode=require` unless explicitly downgraded. Redshift's posture demands it.
+- **Opt-in partitioning.** Connectorx's headline feature; making it opt-in keeps the simple case simple. `partition_num=1` is treated as `Single` so the arg space is uniform.
 - **Postgres for CI, real Redshift for pre-release.** Redshift speaks Postgres wire protocol, so Postgres covers ~90% of plumbing; Redshift-only quirks (`SUPER`, multi-node partitioning) are caught by a gated suite before tagging.
 - **Streaming, never buffering.** Bound the channel at `partition_num`; emit Arrow batches chunk-at-a-time into DuckDB.
+- **No connection pool in v1.** Pooling adds non-trivial state and lifecycle bugs; ship without it and add pooling once usage patterns are observed.
+- **Best-effort type mapping.** Spec lists known mappings and known unsupported types; everything else falls through to a clear error. Adding a new mapping requires adding a test.
 - **No mocks of connectorx or DuckDB.** Mocks at integration boundaries diverge from reality; the Arrow C-data interface only meaningfully tests against a real DuckDB.
 
 ## Open Questions
